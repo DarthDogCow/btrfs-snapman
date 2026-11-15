@@ -1,4 +1,4 @@
-.TH BTRFS-SNAPMAN 1 "November 2026" "btrfs-snapman 0.5.1" "User Commands"
+.TH BTRFS-SNAPMAN 1 "November 2026" "btrfs-snapman 0.6.0" "User Commands"
 .SH NAME
 btrfs-snapman \- GTK4 manager for btrfs subvolume snapshots
 .SH SYNOPSIS
@@ -10,6 +10,10 @@ lists the volumes defined in
 and the snapshots in each volume's snapshot folder.
 It can create and delete snapshots, toggle their read-only flag, and create or
 remove volumes.
+New volumes go under a parent folder: one listed in the config, or one chosen
+with
+.B Browse
+in the New volume dialog and approved as a new location.
 .PP
 The GUI runs as the calling user.
 Every operation goes through
@@ -19,7 +23,7 @@ to a root helper in
 each governed by its own polkit action:
 listing needs no password for the active local session, snapshot changes ask
 for an administrator password (cached for a few minutes), and creating or
-removing a volume asks every time.
+removing a volume, or approving a new location, asks every time.
 .SH FILES
 .TP
 .I /etc/btrfs-snapman/config.toml
@@ -30,6 +34,11 @@ The program never modifies it.
 .TP
 .I /etc/btrfs-snapman/volumes.d/<name>.toml
 One file per volume created in the GUI.
+.TP
+.I /etc/btrfs-snapman/parents.d/<path>.toml
+One file per parent folder approved in the GUI, named after its path
+(e.g.\&
+.IR mnt-vmstorage-vmdisks.toml ).
 .TP
 .I /usr/share/doc/btrfs-snapman/examples/config.example.toml
 Annotated example configuration.

@@ -26,4 +26,5 @@ Description: GTK4 manager for btrfs subvolume snapshots
  .
  The GUI runs as the user. Every operation goes through pkexec to one of
  three small root helpers, each with its own polkit action. The helpers only
- accept volume names from root-owned configuration in /etc/btrfs-snapman.
+ accept volume names from root-owned configuration in /etc/btrfs-snapman,
+ plus folders the administrator approves as new volume locations.

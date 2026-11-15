@@ -35,6 +35,8 @@ snapshot_dir = "/snapshots/home"
 # Optional: where "New volume" in the GUI may create subvolumes, and where their
 # snapshots go (<snapshot_root>/<folder>). Volumes the GUI creates are written to
 # /etc/btrfs-snapman/volumes.d/<name>.toml; this file is never modified.
+# Parents can also be approved in the GUI (New volume > Browse…), which writes
+# /etc/btrfs-snapman/parents.d/<path>.toml with a [parent] table of the same two keys.
 # [[create.parent]]
 # path = "/mnt/vmstorage/vmdisks"
 # snapshot_root = "/mnt/vmstorage/snapshots"

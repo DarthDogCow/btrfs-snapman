@@ -1,6 +1,6 @@
 #!/bin/bash
-# Integration tests for the root helper, run against a real btrfs filesystem in a
-# 1 GB loopback file. Nothing outside the temporary directory is touched.
+# Integration tests for the root helper, run against real btrfs filesystems in two
+# 1 GB loopback files. Nothing outside the temporary directory is touched.
 # Usage: sudo PY=/usr/bin/python3 tests/test_core.sh [path/to/src]
 set -u
 SRC=$(realpath "${1:-$(dirname "$0")/../src}")
@@ -8,16 +8,24 @@ PY=${PY:-/usr/bin/python3}
 WORK=$(mktemp -d)
 IMG=$WORK/fs.img
 MNT=$WORK/mnt
+IMG2=$WORK/fs2.img      # a second filesystem, for add-parent's same-filesystem check
+MNT2=$WORK/mnt2
 CFGDIR=$WORK/etc
 pass=0; fail=0
 
 # Always unmount and clean up, even if a test blows up.
-cleanup() { kill $HOLDER 2>/dev/null; umount "$MNT/mounted" 2>/dev/null; umount "$MNT" 2>/dev/null; rm -rf "$WORK"; }
+cleanup() {
+  kill $HOLDER 2>/dev/null
+  umount "$MNT/mounted" "$MNT" "$MNT2" "$WORK/tmpfs" 2>/dev/null
+  rm -rf "$WORK"
+}
 HOLDER=""
 trap cleanup EXIT
 
 # ---------------------------------------------------------------- build a test filesystem
 truncate -s 1G "$IMG" && mkfs.btrfs -q "$IMG" && mkdir -p "$MNT" && mount -o loop "$IMG" "$MNT" || exit 2
+truncate -s 1G "$IMG2" && mkfs.btrfs -q "$IMG2" && mkdir -p "$MNT2" && mount -o loop "$IMG2" "$MNT2" || exit 2
+mkdir -p "$WORK/tmpfs" && mount -t tmpfs tmpfs "$WORK/tmpfs" || exit 2
 btrfs -q subvolume create "$MNT/@vms" >/dev/null
 chattr +C "$MNT/@vms"
 echo disk > "$MNT/@vms/win11.qcow2"
@@ -224,6 +232,78 @@ sleep 1; run admin snapshot Gone b >/dev/null
 check "delete data + snapshots"                 ok   manage remove-volume Gone --delete-data --delete-snapshots
 assert "  everything gone"                      [ ! -e "$MNT/vmdisks/gone" -a ! -e "$MNT/vmsnaps/gone" -a ! -e "$CFGDIR/volumes.d/Gone.toml" ]
 assert "  reported 2 snapshots deleted"         [ "$(field "d['result']['deleted_snapshots']")" = "2" ]
+
+# ---------------------------------------------------------------- add-parent / remove-parent
+PDIR=$CFGDIR/parents.d
+mkdir -p "$MNT/approved" "$MNT/other" "$MNT2/othersnaps"
+ln -s "$MNT/other" "$MNT/other-link"
+ln -s "$MNT/snapshots" "$MNT/snaps-link"
+ln -s "$MNT" "$WORK/mnt-link"
+
+check "approve a new parent"                    ok   manage add-parent "$MNT/approved" "$MNT/approved-snaps"
+PFILE=$(field "d['result']['origin_file']")
+assert "  parents.d file written, root 0644"    [ "$(stat -c '%U %a' "$PFILE")" = "root 644" ]
+assert "  named after the path"                 [ "$PFILE" = "$PDIR/$(tr / - <<<"${MNT#/}/approved").toml" ]
+assert "  missing snapshot_root created"        [ -d "$MNT/approved-snaps" ]
+check "approved parent is listed"               ok   query list
+assert "  as a drop-in parent"                  [ "$(field "[p['origin'] for p in d['result']['create_parents'] if p['path'] == '$MNT/approved']")" = "['dropin']" ]
+check "approving it twice refused"              fail manage add-parent "$MNT/approved" "$MNT/approved-snaps"
+check "config.toml parent can't be re-approved" fail manage add-parent "$MNT/vmdisks" "$MNT/vmsnaps"
+
+check "new-volume under approved parent"        ok   manage new-volume Approved "$MNT/approved" appvol --nocow
+assert "  subvolume + snapshot dir created"     [ -d "$MNT/approved/appvol" -a -d "$MNT/approved-snaps/appvol" ]
+assert "  subvolume is a subvolume"             sh -c "btrfs subvolume show '$MNT/approved/appvol' >/dev/null 2>&1"
+check "  snapshot it"                           ok   admin snapshot Approved first
+assert "  snapshot is in the snapshot root"     [ -d "$MNT/approved-snaps/appvol/$(field "d['result']['name']")" ]
+check "  list"                                  ok   query list
+assert "  data deletable under approved parent" [ "$(vol "v['Approved']['data_deletable']")" = "True" ]
+
+check "different filesystem refused"            fail manage add-parent "$MNT/other" "$MNT2/othersnaps"
+assert "  because of the filesystem"            grep -q "different btrfs filesystems" <<<"$LAST"
+check "missing root on other fs refused"        fail manage add-parent "$MNT/other" "$MNT2/newsnaps"
+assert "  and not created"                      [ ! -e "$MNT2/newsnaps" ]
+check "non-btrfs path refused"                  fail manage add-parent "$WORK/tmpfs" "$MNT/tmpsnaps"
+assert "  as not btrfs"                         grep -q "not on a btrfs" <<<"$LAST"
+
+for p in / /boot /etc /usr /var/lib /proc/self /sys/kernel /dev/shm; do
+  check "system path $p refused"                fail manage add-parent "$p" "$MNT/syssnaps"
+  assert "  as a system location"               grep -q "system location" <<<"$LAST"
+done
+check "system snapshot_root refused"            fail manage add-parent "$MNT/other" /usr
+assert "  as a system location"                 grep -q "system location" <<<"$LAST"
+
+check "symlinked path refused"                  fail manage add-parent "$MNT/other-link" "$MNT/othersnaps"
+check "symlink inside the path refused"         fail manage add-parent "$WORK/mnt-link/other" "$MNT/othersnaps"
+check "symlinked snapshot_root refused"         fail manage add-parent "$MNT/other" "$MNT/snaps-link"
+check "root under a symlink refused"            fail manage add-parent "$MNT/other" "$MNT/snaps-link/new"
+assert "  and not created"                      [ ! -e "$MNT/snapshots/new" ]
+check "relative path refused"                   fail manage add-parent other "$MNT/othersnaps"
+check "'..' in path refused"                    fail manage add-parent "$MNT/approved/../other" "$MNT/othersnaps"
+check "missing path refused"                    fail manage add-parent "$MNT/nope" "$MNT/othersnaps"
+check "path == snapshot_root refused"           fail manage add-parent "$MNT/other" "$MNT/other"
+assert "refusals wrote nothing"                 [ "$(ls "$PDIR")" = "$(basename "$PFILE")" -a ! -e "$MNT/othersnaps" ]
+
+# bad parents.d files are skipped and reported, like volumes.d
+printf '[parent]\npath = "relative"\nsnapshot_root = "/x"\n' > "$PDIR/broken.toml"
+printf '[parent]\npath = "%s"\nsnapshot_root = "%s"\n' "$MNT/vmdisks" "$MNT/x" > "$PDIR/dup.toml"
+printf '[parent]\npath = "%s"\nsnapshot_root = "%s"\n' "$MNT/other" "$MNT/snapshots" > "$PDIR/open.toml"
+chmod 644 "$PDIR/broken.toml" "$PDIR/dup.toml"; chmod 666 "$PDIR/open.toml"
+check "bad parents.d files don't break list"    ok   query list
+assert "  all three reported"                   [ "$(field "sum('parents.d' in e for e in d['result']['config_errors'])")" = "3" ]
+assert "  none of them loaded"                  [ "$(field "sorted(p['path'] for p in d['result']['create_parents'])")" = "['$MNT/approved', '$MNT/vmdisks']" ]
+check "world-writable parent not usable"        fail manage new-volume Open "$MNT/other" open
+rm "$PDIR/broken.toml" "$PDIR/dup.toml" "$PDIR/open.toml"
+
+check "config.toml parent can't be removed"     fail manage remove-parent "$MNT/vmdisks"
+check "unknown parent can't be removed"         fail manage remove-parent "$MNT/other"
+check "remove approved parent"                  ok   manage remove-parent "$MNT/approved"
+assert "  warns about the volume under it"      grep -q "Approved" <<<"$(field "d['warnings']")"
+assert "  file gone, data untouched"            [ ! -e "$PFILE" -a -d "$MNT/approved/appvol" -a -d "$MNT/approved-snaps/appvol" ]
+check "  list"                                  ok   query list
+assert "  parent gone, volume still listed"     [ "$(field "[p['path'] for p in d['result']['create_parents']]")" = "['$MNT/vmdisks']" -a "$(vol "v['Approved']['data_deletable']")" = "False" ]
+check "new-volume under removed parent refused" fail manage new-volume Late "$MNT/approved" late
+check "approve it again"                        ok   manage add-parent "$MNT/approved" "$MNT/approved-snaps"
+assert "  same file name"                       [ "$(field "d['result']['origin_file']")" = "$PFILE" ]
 
 # ---------------------------------------------------------------- config hardening
 chmod 666 "$CFGDIR/config.toml"

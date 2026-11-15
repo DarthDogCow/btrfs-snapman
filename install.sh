@@ -19,7 +19,7 @@ remove_legacy() {
         /usr/share/polkit-1/actions/dev.snapman.btrfs-snapman.policy
 }
 
-# Uninstall: "remove", not "purge", so dpkg keeps the conffile and volumes.d.
+# Uninstall: "remove", not "purge", so dpkg keeps the conffile, volumes.d and parents.d.
 if [ "${1:-}" = "--uninstall" ]; then
   remove_legacy
   if dpkg-query -W -f='${Status}' btrfs-snapman 2>/dev/null | grep -q '^install ok installed'; then

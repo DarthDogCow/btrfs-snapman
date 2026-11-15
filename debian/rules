@@ -15,7 +15,8 @@ override_dh_auto_install:
 	        $(PKG)/usr/share/polkit-1/actions/io.github.darthdogcow.BtrfsSnapman.policy
 	install -D -m 644 data/io.github.darthdogcow.BtrfsSnapman.desktop \
 	        $(PKG)/usr/share/applications/io.github.darthdogcow.BtrfsSnapman.desktop
-	# Conffile (dh_installdeb marks everything under /etc). volumes.d is owned but
-	# shipped empty: the GUI writes one file per volume there and dpkg never touches them.
+	# Conffile (dh_installdeb marks everything under /etc). volumes.d and parents.d are
+	# owned but shipped empty: the GUI writes one file per volume / approved parent there
+	# and dpkg never touches them.
 	install -D -m 644 data/config.example.toml $(PKG)/etc/btrfs-snapman/config.toml
-	install -d -m 755 $(PKG)/etc/btrfs-snapman/volumes.d
+	install -d -m 755 $(PKG)/etc/btrfs-snapman/volumes.d $(PKG)/etc/btrfs-snapman/parents.d

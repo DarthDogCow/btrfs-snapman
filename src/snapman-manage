@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -IB
-# Volume management entry point: new-volume / remove-volume.
+# Volume management entry point: new-volume / remove-volume / add-parent / remove-parent.
 # Polkit asks for the admin password every time (auth_admin, no caching).
 import sys
 sys.path.insert(0, "/usr/lib/btrfs-snapman")

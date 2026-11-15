@@ -29,10 +29,10 @@
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/btrfs-snapman/snapman-admin</annotate>
   </action>
-  <!-- New volume / remove volume: admin password every time, never cached. -->
+  <!-- New/remove volume, approve/remove a parent location: admin password every time, never cached. -->
   <action id="io.github.darthdogcow.BtrfsSnapman.manage">
-    <description>Create or remove btrfs-snapman volumes</description>
-    <message>Authentication is required to create or remove a volume</message>
+    <description>Create or remove btrfs-snapman volumes and locations</description>
+    <message>Authentication is required to create or remove a volume or location</message>
     <icon_name>drive-harddisk</icon_name>
     <defaults>
       <allow_any>auth_admin</allow_any>

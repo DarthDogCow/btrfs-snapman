@@ -7,13 +7,15 @@ via pkexec, and each has its own polkit rule:
 
   snapman-query   list                          no password (active local session)
   snapman-admin   snapshot | delete | set-ro    password, cached for a few minutes
-  snapman-manage  new-volume | remove-volume    password every time
+  snapman-manage  new-volume | remove-volume |  password every time
+                  add-parent
 
 Run with --no-pkexec only when already root (used for testing).
 """
 
 import datetime as dt
 import json
+import os
 import re
 import sys
 
@@ -58,6 +60,27 @@ def fmt_age(epoch):
 def esc(text):
     """libadwaita titles and subtitles are Pango markup, so escape <, & etc."""
     return GLib.markup_escape_text(str(text))
+
+
+def mount_of(path):
+    """(mount point, fs type) of the mount that contains path, from /proc/self/mountinfo."""
+    best = ("/", "")
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                pre, _, post = line.partition(" - ")
+                fields, post_fields = pre.split(), post.split()
+                if len(fields) < 5 or not post_fields:
+                    continue
+                # mountinfo escapes spaces etc. as \040; turn them back into characters
+                mp = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
+                inside = mp == "/" or path == mp or path.startswith(mp + "/")
+                # later lines are mounted on top of earlier ones, so >= keeps the visible one
+                if inside and len(mp) >= len(best[0]):
+                    best = (mp, post_fields[0])
+    except OSError:
+        pass
+    return best
 
 
 # =========================================================================== helper runner
@@ -138,7 +161,7 @@ class Window(Adw.ApplicationWindow):
         refresh.connect("clicked", lambda *_: self.refresh())
         head.pack_start(refresh)
         self.new_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="New volume…",
-                                  visible=False)
+                                  sensitive=False)
         self.new_btn.connect("clicked", lambda *_: self.dialog_new_volume())
         head.pack_end(self.new_btn)
         view.add_top_bar(head)
@@ -255,7 +278,7 @@ class Window(Adw.ApplicationWindow):
     def refresh(self):
         def ok(result):
             self.data = result
-            self.new_btn.set_visible(bool(result.get("create_parents")))
+            self.new_btn.set_sensitive(True)
             # Broken drop-ins: show a banner, and list the details in the log
             errs = result.get("config_errors", [])
             for e in errs:
@@ -538,15 +561,32 @@ class Window(Adw.ApplicationWindow):
 
     # ------------------------------------------------------------------ volume management
 
+    def choose_folder(self, title, initial, callback):
+        """Pick a folder with the system file chooser; callback(path) only if one was chosen."""
+        fd = Gtk.FileDialog(title=title, modal=True)
+        if initial and os.path.isdir(initial):
+            fd.set_initial_folder(Gio.File.new_for_path(initial))
+
+        def done(dlg, res):
+            try:
+                f = dlg.select_folder_finish(res)
+            except GLib.Error:
+                return              # cancelled
+            if f is not None and f.get_path():
+                callback(f.get_path())
+        fd.select_folder(self, None, done)
+
     def dialog_new_volume(self):
         """Create (or register an existing) subvolume under a configured parent."""
-        parents = self.data.get("create_parents", [])
+        parents = list(self.data.get("create_parents", []))
         d = Adw.AlertDialog(heading="New volume",
                             body="Creates a subvolume and its snapshot folder, and registers it. "
                                  "Asks for your password every time.")
         grp = Adw.PreferencesGroup()
-        parent = Adw.ComboRow(title="Parent",
-                              model=Gtk.StringList.new([p["path"] for p in parents]))
+        model = Gtk.StringList.new([p["path"] for p in parents])
+        parent = Adw.ComboRow(title="Parent", model=model)
+        browse = Gtk.Button(label="Browse…", valign=Gtk.Align.CENTER)
+        parent.add_suffix(browse)
         name = Adw.EntryRow(title="Name (used in snapshot names)", activates_default=True)
         folder = Adw.EntryRow(title="Folder name (optional, defaults to Name)")
         existing = Adw.SwitchRow(title="Use existing subvolume",
@@ -566,7 +606,8 @@ class Window(Adw.ApplicationWindow):
 
         # Keep the preview, the button label and the validity check in sync with the inputs
         def update(*_):
-            p = parents[parent.get_selected()] if parents else None
+            sel = parent.get_selected()
+            p = parents[sel] if sel < len(parents) else None
             fol = folder.get_text() or name.get_text()
             ok = bool(p) and bool(NAME_RE.match(name.get_text())) and bool(NAME_RE.match(fol))
             nocow.set_sensitive(not existing.get_active())
@@ -585,6 +626,24 @@ class Window(Adw.ApplicationWindow):
             w.connect(sig, update)
         update()
 
+        # Browse: select the folder if it's already a parent, otherwise ask to approve it
+        def chosen(path):
+            real = os.path.realpath(path)
+            for i, p in enumerate(parents):
+                if os.path.realpath(p["path"]) == real:
+                    parent.set_selected(i)
+                    return
+            self.dialog_approve_parent(real, added)
+
+        def added(p):
+            parents.append(p)
+            model.append(p["path"])
+            parent.set_selected(len(parents) - 1)
+            self.refresh()
+        browse.connect("clicked", lambda *_: self.choose_folder(
+            "Choose a parent folder", parents[parent.get_selected()]["path"]
+            if parent.get_selected() < len(parents) else GLib.get_home_dir(), chosen))
+
         def resp(_d, r):
             if r != "create":
                 return
@@ -602,6 +661,56 @@ class Window(Adw.ApplicationWindow):
         d.connect("response", resp)
         d.present(self)
         name.grab_focus()
+
+    def dialog_approve_parent(self, path, on_added):
+        """Approve a folder as a new parent (add-parent), with a snapshot root on the same fs."""
+        mp, fstype = mount_of(path)
+        if fstype != "btrfs":
+            self.toast(f"{path} is not on a btrfs filesystem ({fstype or 'unknown'})", 8)
+            return
+        d = Adw.AlertDialog(heading="Approve new location",
+                            body="New volumes may then be created in this folder. Their "
+                                 "snapshots go in the snapshot root, which must be on the same "
+                                 "btrfs filesystem and is created if missing. Asks for your "
+                                 "password.")
+        grp = Adw.PreferencesGroup()
+        folder = Adw.ActionRow(title="Folder", subtitle=esc(path))
+        folder.set_subtitle_selectable(True)
+        folder.add_css_class("property")
+        snap_root = [os.path.join(mp, "snapshots")]
+        root = Adw.ActionRow(title="Snapshot root", subtitle=esc(snap_root[0]))
+        root.set_subtitle_selectable(True)
+        root.add_css_class("property")
+        change = Gtk.Button(label="Browse…", valign=Gtk.Align.CENTER)
+        root.add_suffix(change)
+        grp.add(folder)
+        grp.add(root)
+        grp.add(Adw.ActionRow(title=f"Filesystem mounted at {esc(mp)}",
+                              subtitle=esc("Snapshots of <folder>/X go in <snapshot root>/X")))
+        d.set_extra_child(grp)
+        d.add_response("cancel", "Cancel")
+        d.add_response("approve", "Approve")
+        d.set_response_appearance("approve", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("approve")
+        d.set_close_response("cancel")
+
+        def set_root(p):
+            snap_root[0] = os.path.realpath(p)
+            root.set_subtitle(esc(snap_root[0]))
+        change.connect("clicked", lambda *_: self.choose_folder(
+            "Choose the snapshot root", snap_root[0] if os.path.isdir(snap_root[0]) else mp,
+            set_root))
+
+        def resp(_d, r):
+            if r != "approve":
+                return
+
+            def ok(res):
+                self.toast(f"Approved {res['path']}")
+                on_added(res)
+            self.call("manage", ["add-parent", path, snap_root[0]], ok)
+        d.connect("response", resp)
+        d.present(self)
 
     def dialog_remove_volume(self):
         """Unregister a GUI-managed volume, optionally deleting its data and snapshots."""

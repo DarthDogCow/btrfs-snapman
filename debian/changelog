@@ -1,3 +1,15 @@
+btrfs-snapman (0.6.0) noble; urgency=medium
+
+  * New volume: "Browse…" next to Parent picks a folder. A folder that isn't
+    a parent yet can be approved as a new location, with a snapshot root on
+    the same btrfs filesystem.
+  * New snapman-manage verbs add-parent and remove-parent, which write and
+    remove /etc/btrfs-snapman/parents.d/<path>.toml.
+  * load_config merges parents.d into the create parents, with the same
+    ownership checks and skip-and-report handling as volumes.d.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Sun, 15 Nov 2026 10:29:46 +0000
+
 btrfs-snapman (0.5.1) noble; urgency=medium
 
   * Install build-essential before dpkg-buildpackage in install.sh and

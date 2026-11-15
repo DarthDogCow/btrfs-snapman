@@ -4,16 +4,20 @@ btrfs-snapman core: the only code that runs as root.
 It is called by three tiny entry scripts, each with its own polkit rule:
   snapman-query   list                                  no password (active session)
   snapman-admin   snapshot | delete | set-ro            password, cached a few minutes
-  snapman-manage  new-volume | remove-volume            password every time
+  snapman-manage  new-volume | remove-volume |          password every time
+                  add-parent | remove-parent
 
 Design rules
-  * A fixed set of operations. The GUI passes names, never arbitrary paths.
+  * A fixed set of operations. The GUI passes names, never arbitrary paths, except to
+    add-parent, which checks both paths (real directories, same btrfs filesystem, not a
+    system location) before approving them.
   * Every path comes from root-owned config:
       /etc/btrfs-snapman/config.toml        hand-written: defaults, create parents, volumes
       /etc/btrfs-snapman/volumes.d/*.toml   one file per volume; the tool writes and removes these
+      /etc/btrfs-snapman/parents.d/*.toml   one file per approved create parent; likewise
   * The tool never edits config.toml. It only adds or removes its own drop-in files.
   * Snapshot deletes are confined to a volume's snapshot_dir. Source subvolumes can only
-    be deleted if they live directly under a [[create.parent]] path.
+    be deleted if they live directly under a create parent (config.toml or parents.d).
   * Uses libbtrfsutil (python3-btrfsutil); never parses btrfs CLI output.
   * Every change is logged to the journal with the invoking user's UID.
   * Output is a single JSON object on stdout.
@@ -22,6 +26,7 @@ Design rules
 import array
 import datetime as _dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -48,10 +53,20 @@ FS_IOC_GETFLAGS = 0x80086601
 FS_IOC_SETFLAGS = 0x40086602
 FS_NOCOW_FL = 0x00800000
 
+# _IOR(0x94, 31, struct btrfs_ioctl_fs_info_args): 1024 bytes, the fsid is bytes 16-31.
+BTRFS_IOC_FS_INFO = 0x8400941F
+
+# Never approved as a create parent or snapshot root: these exact paths, and anything
+# at all under the virtual filesystems.
+FORBIDDEN_LOCATIONS = ("/", "/boot", "/etc", "/usr", "/var/lib")
+FORBIDDEN_TREES = ("/proc", "/sys", "/dev")
+
 HOOK_TIMEOUT = 120
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 DROPIN_HEADER = ("# Managed by btrfs-snapman. Created via the GUI; removing the volume in the\n"
                  "# GUI deletes this file. Safe to edit by hand (e.g. to add hooks).\n")
+PARENT_HEADER = ("# Managed by btrfs-snapman. Approved via New volume > Browse; remove it with\n"
+                 "# 'snapman-manage remove-parent PATH' or by deleting this file.\n")
 
 
 class SnapError(Exception):
@@ -110,8 +125,17 @@ def _parse_volume(v, defaults, origin, origin_file):
     }
 
 
+def _parse_parent(p, origin, origin_file):
+    """Validate one create parent from either config.toml or a parents.d drop-in."""
+    if not (isinstance(p, dict) and all(isinstance(p.get(k), str) and os.path.isabs(p[k])
+                                        for k in ("path", "snapshot_root"))):
+        raise SnapError("a create parent needs an absolute path and snapshot_root")
+    return {"path": p["path"], "snapshot_root": p["snapshot_root"],
+            "origin": origin, "origin_file": origin_file}
+
+
 def load_config(path=CONFIG_PATH, enforce_ownership=True):
-    """Load config.toml plus every volumes.d/*.toml drop-in.
+    """Load config.toml plus every volumes.d/*.toml and parents.d/*.toml drop-in.
 
     A broken drop-in is skipped and reported in config_errors, so one bad file
     can't take the whole tool down. A broken config.toml is fatal.
@@ -120,6 +144,7 @@ def load_config(path=CONFIG_PATH, enforce_ownership=True):
         raise SnapError(f"config not found: {path}")
     etc = os.path.dirname(path)
     dropin_dir = os.path.join(etc, "volumes.d")
+    parent_dir = os.path.join(etc, "parents.d")
     if enforce_ownership:
         _check_root_owned(etc)
         _check_root_owned(path)
@@ -165,17 +190,35 @@ def load_config(path=CONFIG_PATH, enforce_ownership=True):
                 errors.append(f"{fp}: {e}")
 
     # Where new volumes may be created, and where their snapshots go:
-    #   [[create.parent]]
+    #   [[create.parent]]                   in config.toml, or [parent] in parents.d/*.toml
     #   path = "/mnt/vmstorage/vmdisks"
     #   snapshot_root = "/mnt/vmstorage/snapshots"
-    parents = []
-    for p in raw.get("create", {}).get("parent", []):
-        if not (os.path.isabs(p.get("path", "")) and os.path.isabs(p.get("snapshot_root", ""))):
-            raise SnapError("each [[create.parent]] needs absolute path and snapshot_root")
-        parents.append({"path": p["path"], "snapshot_root": p["snapshot_root"]})
+    parents = [_parse_parent(p, "config", path) for p in raw.get("create", {}).get("parent", [])]
+
+    # Parents approved in the GUI, one [parent] table per file.
+    if os.path.isdir(parent_dir):
+        if enforce_ownership:
+            _check_root_owned(parent_dir)
+        for fn in sorted(os.listdir(parent_dir)):
+            # skip non-TOML files and the .tmp-*.toml left by an interrupted write
+            if not fn.endswith(".toml") or fn.startswith("."):
+                continue
+            fp = os.path.join(parent_dir, fn)
+            try:
+                if enforce_ownership:
+                    _check_root_owned(fp)
+                with open(fp, "rb") as f:
+                    par = _parse_parent(tomllib.load(f).get("parent"), "dropin", fp)
+                real = os.path.realpath(par["path"])
+                dup = next((p for p in parents if os.path.realpath(p["path"]) == real), None)
+                if dup:
+                    raise SnapError(f"{par['path']} is already a parent in {dup['origin_file']}")
+                parents.append(par)
+            except (SnapError, OSError, tomllib.TOMLDecodeError) as e:
+                errors.append(f"{fp}: {e}")
 
     return {"volumes": volumes, "create_parents": parents, "config_errors": errors,
-            "defaults": defaults, "dropin_dir": dropin_dir}
+            "defaults": defaults, "dropin_dir": dropin_dir, "parent_dir": parent_dir}
 
 
 # =========================================================================== small helpers
@@ -383,14 +426,19 @@ def _toml_str(s):
 
 
 def _write_dropin(cfg, name, path, snapshot_dir):
-    """Atomically write volumes.d/<name>.toml (temp file, fsync, rename)."""
-    os.makedirs(cfg["dropin_dir"], mode=0o755, exist_ok=True)
-    target = os.path.join(cfg["dropin_dir"], f"{name}.toml")
+    """Write volumes.d/<name>.toml."""
     body = (DROPIN_HEADER + "\n[volume]\n"
             f"name = {_toml_str(name)}\n"
             f"path = {_toml_str(path)}\n"
             f"snapshot_dir = {_toml_str(snapshot_dir)}\n")
-    fd, tmp = tempfile.mkstemp(dir=cfg["dropin_dir"], prefix=".tmp-", suffix=".toml")
+    return _atomic_write(cfg["dropin_dir"], f"{name}.toml", body)
+
+
+def _atomic_write(directory, filename, body):
+    """Atomically write directory/filename as root, mode 0644 (temp file, fsync, rename)."""
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    target = os.path.join(directory, filename)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".toml")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(body)
@@ -403,7 +451,7 @@ def _write_dropin(cfg, name, path, snapshot_dir):
             os.unlink(tmp)
         raise
     # make the rename itself durable
-    dfd = os.open(cfg["dropin_dir"], os.O_RDONLY | os.O_DIRECTORY)
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(dfd)
     finally:
@@ -563,7 +611,7 @@ def op_new_volume(cfg, name, parent, folder=None, nocow=False, existing=False):
         raise SnapError(f"a volume called {name} already exists")
     par = next((p for p in cfg["create_parents"] if p["path"] == parent), None)
     if par is None:
-        raise SnapError("parent is not a [[create.parent]] in config.toml")
+        raise SnapError("parent is not an approved location ([[create.parent]] or parents.d)")
 
     base = os.path.realpath(par["path"])
     snap_root = os.path.realpath(par["snapshot_root"])
@@ -698,6 +746,123 @@ def op_remove_volume(cfg, name, delete_data=False, final_snapshot=True, delete_s
     return result, commands, warnings
 
 
+def _fsid(path):
+    """The UUID of the btrfs filesystem that directory path is on (BTRFS_IOC_FS_INFO)."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        buf = bytearray(1024)
+        try:
+            fcntl.ioctl(fd, BTRFS_IOC_FS_INFO, buf, True)
+        except OSError:
+            raise SnapError(f"{path} is not on a btrfs filesystem") from None
+        return _uuid_str(buf[16:32])
+    finally:
+        os.close(fd)
+
+
+def _check_location(path, what, may_create=False):
+    """Check a path given to add-parent and return the fsid of its filesystem.
+
+    It must be absolute and normalised, not a system location, and a real directory on
+    btrfs with no symlink anywhere in it. With may_create, a missing path is allowed if
+    its parent directory passes the same checks (add-parent then creates it).
+    """
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise SnapError(f"{what} must be an absolute path without '..', '//' or a "
+                        f"trailing '/': {path!r}")
+    if not SAFE_PATH_RE.match(path):
+        raise SnapError(f"{what} contains characters this tool won't write to config: {path}")
+    if path in FORBIDDEN_LOCATIONS or \
+            any(path == t or path.startswith(t + "/") for t in FORBIDDEN_TREES):
+        raise SnapError(f"{what} {path} is a system location; refusing")
+    d = os.path.dirname(path) if may_create and not os.path.lexists(path) else path
+    if os.path.islink(d):
+        raise SnapError(f"{what} {d} is a symlink; choose the real folder")
+    if not os.path.isdir(d):
+        raise SnapError(f"{what} {d} does not exist or is not a directory")
+    if os.path.realpath(d) != d:
+        raise SnapError(f"{what} {d} goes through a symlink; choose the real folder "
+                        f"({os.path.realpath(d)})")
+    return _fsid(d)
+
+
+def _parent_file_name(cfg, path):
+    """parents.d file name for path, e.g. /mnt/vmstorage/vmdisks -> mnt-vmstorage-vmdisks.toml.
+
+    Different paths can sanitise to the same name (/a-b/c, /a/b-c); the second one
+    gets a short hash of its path appended instead of replacing the first.
+    """
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", path).strip("-._")[:64] or "root"
+    for name in (base, f"{base[:55]}-{hashlib.sha256(path.encode()).hexdigest()[:8]}"):
+        if not os.path.lexists(os.path.join(cfg["parent_dir"], name + ".toml")):
+            return name + ".toml"
+    raise SnapError(f"{cfg['parent_dir']}/{base}.toml and its alternative both exist; "
+                    "clean up parents.d by hand")
+
+
+def op_add_parent(cfg, path, snapshot_root):
+    """Approve a new create parent by writing parents.d/<sanitised path>.toml.
+
+    Both paths must pass _check_location and be on the same btrfs filesystem (snapshots
+    can't cross filesystems). snapshot_root is created if it's missing.
+    """
+    fsid = _check_location(path, "path")
+    root_fsid = _check_location(snapshot_root, "snapshot_root", may_create=True)
+    if fsid != root_fsid:
+        raise SnapError(f"{path} and {snapshot_root} are on different btrfs filesystems "
+                        f"({fsid} vs {root_fsid}); snapshots must stay on the same one")
+    if path == snapshot_root:
+        raise SnapError("path and snapshot_root must be different folders")
+    dup = next((p for p in cfg["create_parents"] if os.path.realpath(p["path"]) == path), None)
+    if dup:
+        raise SnapError(f"{path} is already approved in {dup['origin_file']}")
+    filename = _parent_file_name(cfg, path)
+
+    commands, undo = [], []
+    try:
+        if not os.path.isdir(snapshot_root):
+            os.mkdir(snapshot_root, 0o755)
+            undo.append(lambda: os.rmdir(snapshot_root))
+            commands.append(_q("mkdir", snapshot_root))
+        body = (PARENT_HEADER + "\n[parent]\n"
+                f"path = {_toml_str(path)}\n"
+                f"snapshot_root = {_toml_str(snapshot_root)}\n")
+        target = _atomic_write(cfg["parent_dir"], filename, body)
+        commands.append(f"# wrote {target}")
+    except BaseException:
+        for fn in reversed(undo):
+            try:
+                fn()
+            except Exception:
+                pass
+        raise
+    _log(f"add-parent path={path} snapshot_root={snapshot_root} fsid={fsid} file={target}")
+    return {"path": path, "snapshot_root": snapshot_root, "origin": "dropin",
+            "origin_file": target}, commands, []
+
+
+def op_remove_parent(cfg, path):
+    """Withdraw a parent approved with add-parent. Nothing on disk changes except its file.
+
+    Volumes already created under it stay registered, but their data can no longer be
+    deleted through the tool (that needs the subvolume to sit directly under a parent).
+    """
+    par = next((p for p in cfg["create_parents"] if p["path"] == path), None)
+    if par is None:
+        raise SnapError(f"{path} is not an approved location")
+    if par["origin"] != "dropin":
+        raise SnapError(f"{path} is defined in {par['origin_file']}; remove it there by hand")
+    base = os.path.realpath(path)
+    under = sorted(v["name"] for v in cfg["volumes"].values()
+                   if os.path.dirname(os.path.realpath(v["path"])) == base)
+    os.unlink(par["origin_file"])
+    _log(f"remove-parent path={path} ({par['origin_file']})")
+    warnings = [f"still registered under {path}: {', '.join(under)}; their data can no longer "
+                "be deleted from the GUI"] if under else []
+    return {"path": path, "removed": par["origin_file"]}, \
+        [f"# removed {par['origin_file']}"], warnings
+
+
 # =========================================================================== entry point
 
 USAGE = {
@@ -705,7 +870,8 @@ USAGE = {
     "admin": "snapshot VOLUME [COMMENT] [--ro|--rw] | delete VOLUME SNAPSHOT | "
              "set-ro VOLUME SNAPSHOT true|false [--force]",
     "manage": "new-volume NAME PARENT [FOLDER] [--nocow] [--existing] | "
-              "remove-volume NAME [--delete-data] [--no-final-snapshot] [--delete-snapshots]",
+              "remove-volume NAME [--delete-data] [--no-final-snapshot] [--delete-snapshots] | "
+              "add-parent PATH SNAPSHOT_ROOT | remove-parent PATH",
 }
 
 
@@ -744,6 +910,10 @@ def dispatch(mode, argv, cfg):
             delete_snaps = "--delete-snapshots" in flags
             final = delete_data and not delete_snaps and "--no-final-snapshot" not in flags
             return op_remove_volume(cfg, pos[0], delete_data, final, delete_snaps)
+        if verb == "add-parent" and len(pos) == 2 and not flags:
+            return op_add_parent(cfg, *pos)
+        if verb == "remove-parent" and len(pos) == 1 and not flags:
+            return op_remove_parent(cfg, pos[0])
 
     raise SnapError("usage: " + USAGE[mode])
 

@@ -8,6 +8,7 @@ A small GTK4/libadwaita GUI for managing btrfs subvolumes and snapshots by hand.
 - **Read-only switch** for each snapshot. A snapshot created by `btrfs receive` asks for an extra confirmation before going writable.
 - **Delete snapshot**: you type `delete` to confirm. It refuses mounted snapshots and snapshots containing nested subvolumes.
 - **New volume**: creates the subvolume (optionally with NOCOW) and its snapshot folder, and registers it, all in one step. It can also register a subvolume that already exists. If any step fails, the earlier steps are undone.
+- **Approve a new location**: **Browse…** next to Parent picks any folder. If it isn't a parent yet, you're asked to approve it, together with a snapshot root (default: `<mount point>/snapshots` of the same filesystem, changeable with a second Browse). The snapshot root is created if it's missing.
 - **Remove volume**: either unregister only, leaving the data alone, or delete the subvolume. By default it takes a final read-only snapshot first. It can also delete every snapshot and the snapshot folder.
 - **Command log**: every action shows the equivalent `btrfs` command, and every change is logged to the journal (`journalctl -t btrfs-snapman`).
 
@@ -18,12 +19,13 @@ A small GTK4/libadwaita GUI for managing btrfs subvolumes and snapshots by hand.
   |---|---|---|
   | `snapman-query` | list | none (active local session) |
   | `snapman-admin` | snapshot, delete snapshot, set read-only | yes, cached a few minutes |
-  | `snapman-manage` | new volume, remove volume | yes, **every time** |
+  | `snapman-manage` | new volume, remove volume, approve / remove a location | yes, **every time** |
 
-- The helpers accept names only, never arbitrary paths. Every path comes from root-owned config, and the helpers refuse to start if `config.toml` is writable by anyone other than root. A drop-in file with bad permissions is skipped and reported instead.
-- The tool **never edits `config.toml`**. Volumes created in the GUI are written to `volumes.d/<name>.toml`, one file each, and removing the volume deletes that file. Volumes defined in `config.toml` can't be removed from the GUI.
+- The helpers accept names only, with one exception: approving a location (`add-parent PATH SNAPSHOT_ROOT`). Every other path comes from root-owned config, and the helpers refuse to start if `config.toml` is writable by anyone other than root. A drop-in file with bad permissions is skipped and reported instead.
+- `add-parent` only accepts two absolute, existing, real directories (no symlink anywhere in the path) on the **same** btrfs filesystem, compared by fsid. It refuses `/`, `/boot`, `/etc`, `/usr`, `/var/lib`, and anything under `/proc`, `/sys` or `/dev`.
+- The tool **never edits `config.toml`**. Volumes created in the GUI are written to `volumes.d/<name>.toml`, and approved locations to `parents.d/<path>.toml`, one file each; removing the volume or location deletes that file. Anything defined in `config.toml` can't be removed from the GUI.
 - Snapshot deletes are confined to the volume's snapshot folder; symlinks and `..` are rejected.
-- **Deleting a volume's data** is only allowed when the subvolume sits directly under a `[[create.parent]]` path. The tool also refuses if:
+- **Deleting a volume's data** is only allowed when the subvolume sits directly under a create parent (`[[create.parent]]` or `parents.d`). The tool also refuses if:
   - the subvolume is mounted,
   - it contains nested subvolumes, or
   - any process has files open in it. The error names the process, e.g. a running VM.
@@ -45,10 +47,11 @@ btrfs-snapman                     # or "Btrfs Snapshots" in the app grid
 | `/usr/share/polkit-1/actions/io.github.darthdogcow.BtrfsSnapman.policy` | the three polkit actions |
 | `/etc/btrfs-snapman/config.toml` | config (a dpkg conffile) |
 | `/etc/btrfs-snapman/volumes.d/` | one file per GUI-created volume; owned by the package, contents never touched |
+| `/etc/btrfs-snapman/parents.d/` | one file per location approved in the GUI; likewise |
 
 **Upgrading:** pull and run `sudo ./install.sh` again. Your `config.toml` is kept; if the packaged example changed, the new one is saved next to it as `config.toml.dpkg-dist`. The annotated example is always at `/usr/share/doc/btrfs-snapman/examples/config.example.toml`.
 
-**Removing:** `sudo ./install.sh --uninstall` (or `sudo apt remove btrfs-snapman`) keeps `/etc/btrfs-snapman`. `apt purge` deletes `config.toml` too, but leaves your `volumes.d/*.toml` files. Versions before 0.5.0 were copied into `/usr/local`; `install.sh` removes that copy in either mode.
+**Removing:** `sudo ./install.sh --uninstall` (or `sudo apt remove btrfs-snapman`) keeps `/etc/btrfs-snapman`. `apt purge` deletes `config.toml` too, but leaves your `volumes.d/*.toml` and `parents.d/*.toml` files. Versions before 0.5.0 were copied into `/usr/local`; `install.sh` removes that copy in either mode.
 
 Machine-specific configs and one-off scripts can go in `local/`, which git ignores.
 
@@ -81,6 +84,14 @@ snapshot_dir = "/mnt/vmstorage/snapshots/win11"
 ```
 If a pre hook fails, the snapshot is aborted. Post hooks always run.
 
+`parents.d/<path>.toml` (written when you approve a location; the name is the path with `/` turned into `-`):
+```toml
+[parent]
+path = "/mnt/vmstorage/vmdisks"
+snapshot_root = "/mnt/vmstorage/snapshots"
+```
+There's no GUI button to withdraw an approval yet: run `sudo /usr/libexec/btrfs-snapman/snapman-manage remove-parent /mnt/vmstorage/vmdisks`, or delete the file. Volumes already created there stay registered, but their data can no longer be deleted from the GUI.
+
 ## Recovering a removed volume
 When you remove a volume and keep its snapshots (with or without the final snapshot), they stay in its snapshot folder but are no longer listed. To bring the volume back:
 ```
@@ -94,7 +105,7 @@ Then use **New volume → Use existing subvolume** with the same folder name. Th
 - NOCOW (`chattr +C`) reduces fragmentation for VM images, but turns off checksums and compression for those files. After a snapshot, the first write to each extent is copied anyway. It can only be set on an empty folder, which is why it's offered in New volume.
 
 ## Tests
-`sudo PY=/usr/bin/python3 tests/test_core.sh src` builds a 1 GB loopback btrfs and runs 77 checks against the helpers: snapshots, hooks, path and symlink confinement, the received-snapshot guard, refusal of mounted and nested snapshots, drop-in loading and permissions, new-volume rollback, and remove-volume with each option, including refusal while a file is open.
+`sudo PY=/usr/bin/python3 tests/test_core.sh src` builds two 1 GB loopback btrfs filesystems and runs 140 checks against the helpers: snapshots, hooks, path and symlink confinement, the received-snapshot guard, refusal of mounted and nested snapshots, drop-in loading and permissions, new-volume rollback, remove-volume with each option (including refusal while a file is open), and add-parent / remove-parent: approval, refusal across filesystems, of system paths and of symlinks, and new-volume under an approved location.
 
 ## Not done (yet)
 - Retention or pruning rules
