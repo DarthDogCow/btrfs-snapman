@@ -1,3 +1,10 @@
+btrfs-snapman (0.5.1) noble; urgency=medium
+
+  * Install build-essential before dpkg-buildpackage in install.sh and
+    the release workflow.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Sun, 15 Nov 2026 10:15:28 +0000
+
 btrfs-snapman (0.5.0) noble; urgency=medium
 
   * Package as a .deb; install under /usr instead of /usr/local.
