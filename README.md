@@ -35,7 +35,7 @@ git clone https://github.com/DarthDogCow/btrfs-snapman && cd btrfs-snapman
 sudo ./install.sh                 # builds btrfs-snapman_<version>_all.deb and installs it with apt
 btrfs-snapman                     # or "Btrfs Snapshots" in the app grid
 ```
-`install.sh` installs `debhelper` if it's missing, builds the package with `dpkg-buildpackage -us -uc -b`, and installs it with `apt`, which pulls in the dependencies. A copy of the `.deb` is left in the source folder. Release builds are also attached to each [GitHub release](https://github.com/DarthDogCow/btrfs-snapman/releases): `sudo apt install ./btrfs-snapman_<version>_all.deb`.
+`install.sh` installs `build-essential` and `debhelper` if they're missing, builds the package with `dpkg-buildpackage -us -uc -b`, and installs it with `apt`, which pulls in the dependencies. A copy of the `.deb` is left in the source folder. Release builds are also attached to each [GitHub release](https://github.com/DarthDogCow/btrfs-snapman/releases): `sudo apt install ./btrfs-snapman_<version>_all.deb`.
 
 | Path | |
 |---|---|

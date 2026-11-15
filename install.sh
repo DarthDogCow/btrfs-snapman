@@ -28,9 +28,14 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo "Removed. Config left in $ETC"; exit 0
 fi
 
-# Build tools (debhelper pulls in dpkg-dev).
-dpkg-query -W -f='${Status}' debhelper 2>/dev/null | grep -q '^install ok installed' \
-  || { echo "Installing build tools: debhelper"; apt-get install -y --no-install-recommends debhelper; }
+# Build tools: dpkg-buildpackage insists on build-essential; debhelper pulls in dpkg-dev.
+tools=()
+for p in build-essential debhelper; do
+  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q '^install ok installed' || tools+=("$p")
+done
+if [ ${#tools[@]} -gt 0 ]; then
+  echo "Installing build tools: ${tools[*]}"; apt-get install -y --no-install-recommends "${tools[@]}"
+fi
 
 # Build in a temporary copy: dpkg-buildpackage writes into the parent directory and
 # leaves root-owned files in debian/. The directory is world-readable so apt's
