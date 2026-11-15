@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+# Machine-specific configs and one-off scripts
+local/
+
+# dpkg-buildpackage output
+*.deb
+*.ddeb
+*.buildinfo
+*.changes
+debian/btrfs-snapman/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper.log

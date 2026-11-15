@@ -1,0 +1,40 @@
+# /etc/btrfs-snapman/config.toml
+# Must be owned by root and not group/world-writable (the helper refuses otherwise).
+# Edit with: sudoedit /etc/btrfs-snapman/config.toml
+
+[defaults]
+# Tokens: {volume} {timestamp} {label}. An empty label drops cleanly (no trailing "_").
+name_format = "{timestamp}_{label}"
+# strftime format; may only produce [A-Za-z0-9._+-]
+timestamp_format = "%Y%m%d-%H%M%S"
+read_only = true
+
+# Volumes can be defined here ([[volume]] blocks) or one per file in volumes.d/
+# (a [volume] table in <name>.toml). The GUI can only remove the volumes.d ones.
+# One [[volume]] per subvolume you snapshot. snapshot_dir must already exist and be on
+# the same btrfs filesystem. The GUI lists every subvolume directly inside snapshot_dir,
+# so snapshots you made by hand show up too. Deletes are confined to snapshot_dir.
+
+[[volume]]
+name = "vm-images"
+path = "/var/lib/libvirt/images"
+snapshot_dir = "/snapshots/vm-images"
+# Optional hooks, run as root around the snapshot. Each is an argv list (no shell).
+# A failing pre hook aborts the snapshot; post hooks always run.
+# pre_snapshot  = [["/usr/libexec/btrfs-snapman/libvirt-fsfreeze", "freeze", "win11"]]
+# post_snapshot = [["/usr/libexec/btrfs-snapman/libvirt-fsfreeze", "thaw",   "win11"]]
+
+[[volume]]
+name = "home"
+path = "/home"
+snapshot_dir = "/snapshots/home"
+# per-volume overrides:
+# name_format = "{volume}-{timestamp}-{label}"
+# read_only = false
+
+# Optional: where "New volume" in the GUI may create subvolumes, and where their
+# snapshots go (<snapshot_root>/<folder>). Volumes the GUI creates are written to
+# /etc/btrfs-snapman/volumes.d/<name>.toml; this file is never modified.
+# [[create.parent]]
+# path = "/mnt/vmstorage/vmdisks"
+# snapshot_root = "/mnt/vmstorage/snapshots"

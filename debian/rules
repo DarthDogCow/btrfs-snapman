@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+# No build step: the program is Python scripts plus data files, installed by hand below.
+PKG := debian/btrfs-snapman
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	install -D -m 644 src/snapman_core.py $(PKG)/usr/lib/btrfs-snapman/snapman_core.py
+	install -d $(PKG)/usr/libexec/btrfs-snapman
+	install -m 755 src/snapman-query src/snapman-admin src/snapman-manage \
+	               contrib/libvirt-fsfreeze $(PKG)/usr/libexec/btrfs-snapman/
+	install -D -m 755 src/btrfs-snapman $(PKG)/usr/bin/btrfs-snapman
+	install -D -m 644 data/io.github.darthdogcow.BtrfsSnapman.policy \
+	        $(PKG)/usr/share/polkit-1/actions/io.github.darthdogcow.BtrfsSnapman.policy
+	install -D -m 644 data/io.github.darthdogcow.BtrfsSnapman.desktop \
+	        $(PKG)/usr/share/applications/io.github.darthdogcow.BtrfsSnapman.desktop
+	# Conffile (dh_installdeb marks everything under /etc). volumes.d is owned but
+	# shipped empty: the GUI writes one file per volume there and dpkg never touches them.
+	install -D -m 644 data/config.example.toml $(PKG)/etc/btrfs-snapman/config.toml
+	install -d -m 755 $(PKG)/etc/btrfs-snapman/volumes.d

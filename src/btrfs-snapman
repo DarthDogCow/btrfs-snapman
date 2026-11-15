@@ -1,0 +1,710 @@
+#!/usr/bin/python3
+"""
+btrfs-snapman GUI (GTK4 + libadwaita).
+
+Runs as your normal user. Every operation goes through one of three root helpers
+via pkexec, and each has its own polkit rule:
+
+  snapman-query   list                          no password (active local session)
+  snapman-admin   snapshot | delete | set-ro    password, cached for a few minutes
+  snapman-manage  new-volume | remove-volume    password every time
+
+Run with --no-pkexec only when already root (used for testing).
+"""
+
+import datetime as dt
+import json
+import re
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.darthdogcow.BtrfsSnapman"
+LIBEXEC = "/usr/libexec/btrfs-snapman"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")   # must match the helper's NAME_RE
+
+
+# =========================================================================== small helpers
+
+def sanitise_label(text):
+    """Clean a comment for use in a name: spaces -> '_', keep only [A-Za-z0-9_-]."""
+    return re.sub(r"[^A-Za-z0-9_-]", "", text.replace(" ", "_"))[:64]
+
+
+def preview_name(v, label):
+    """What the helper will name a snapshot taken now (it builds the real name the same way)."""
+    ts = dt.datetime.now().strftime(v.get("timestamp_format", "%Y%m%d-%H%M%S"))
+    name = v["name_format"].format(volume=v["name"], timestamp=ts, label=label)
+    return re.sub(r"__+", "_", name).strip("_-")
+
+
+def fmt_time(epoch):
+    return dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_age(epoch):
+    """e.g. '3d ago', '5h ago'."""
+    secs = max(0, int(dt.datetime.now().timestamp() - epoch))
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n:
+            return f"{secs // n}{unit} ago"
+    return "just now"
+
+
+def esc(text):
+    """libadwaita titles and subtitles are Pango markup, so escape <, & etc."""
+    return GLib.markup_escape_text(str(text))
+
+
+# =========================================================================== helper runner
+
+class Helper:
+    """Runs a root helper asynchronously and hands its JSON result to a callback."""
+
+    def __init__(self, use_pkexec=True, libexec=LIBEXEC):
+        self.use_pkexec = use_pkexec
+        self.libexec = libexec
+
+    def run(self, mode, args, callback):
+        exe = f"{self.libexec}/snapman-{mode}"
+        argv = (["pkexec", exe] if self.use_pkexec else [exe]) + list(args)
+        try:
+            proc = Gio.Subprocess.new(
+                argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE)
+        except GLib.Error as e:
+            callback({"ok": False, "error": e.message})
+            return
+
+        def done(p, res):
+            try:
+                _, out, err = p.communicate_utf8_finish(res)
+            except GLib.Error as e:
+                callback({"ok": False, "error": e.message})
+                return
+            # pkexec uses exit code 126 for "dialog dismissed", 127 for "not authorised"
+            status = p.get_exit_status()
+            if status == 126:
+                callback({"ok": False, "error": "Authentication cancelled", "cancelled": True})
+                return
+            if status == 127 and not (out or "").strip():
+                callback({"ok": False, "error": "Not authorised (polkit)"})
+                return
+            try:
+                callback(json.loads(out))
+            except (ValueError, TypeError):
+                callback({"ok": False, "error": (err or out or f"helper exited {status}").strip()})
+
+        proc.communicate_utf8_async(None, None, done)
+
+
+# =========================================================================== main window
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, helper):
+        super().__init__(application=app, title="Btrfs Snapshots")
+        self.set_default_size(1000, 700)
+        self.helper = helper
+        self.data = None        # last result of "list"
+        self.current = None     # name of the selected volume
+        self.busy = 0           # number of helper calls in flight
+
+        # Layout: toast overlay > split view (sidebar of volumes | content for one volume)
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+        self.split = Adw.NavigationSplitView(min_sidebar_width=220)
+        self.toasts.set_child(self.split)
+
+        self._build_sidebar()
+        self._build_content()
+
+        # F5 refreshes
+        key = Gtk.ShortcutController()
+        key.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("F5"),
+                                          Gtk.CallbackAction.new(lambda *_: self.refresh() or True)))
+        self.add_controller(key)
+
+        self.refresh()
+
+    def _build_sidebar(self):
+        """Left pane: refresh, New volume, and the list of volumes."""
+        view = Adw.ToolbarView()
+        head = Adw.HeaderBar()
+        head.set_title_widget(Adw.WindowTitle(title="Volumes"))
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh (F5)")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        head.pack_start(refresh)
+        self.new_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="New volume…",
+                                  visible=False)
+        self.new_btn.connect("clicked", lambda *_: self.dialog_new_volume())
+        head.pack_end(self.new_btn)
+        view.add_top_bar(head)
+
+        self.vol_list = Gtk.ListBox()
+        self.vol_list.add_css_class("navigation-sidebar")
+        self.vol_list.connect("row-selected", self.on_volume_selected)
+        sc = Gtk.ScrolledWindow(vexpand=True)
+        sc.set_child(self.vol_list)
+        view.set_content(sc)
+        self.split.set_sidebar(Adw.NavigationPage(title="Volumes", child=view))
+
+    def _build_content(self):
+        """Right pane: header (remove / spinner / snapshot), problems banner, details, command log."""
+        view = Adw.ToolbarView()
+        head = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title="Btrfs Snapshots", subtitle="")
+        head.set_title_widget(self.title)
+        self.remove_btn = Gtk.Button(icon_name="user-trash-symbolic",
+                                     tooltip_text="Remove volume…", visible=False)
+        self.remove_btn.connect("clicked", lambda *_: self.dialog_remove_volume())
+        head.pack_start(self.remove_btn)
+        self.snap_btn = Gtk.Button(label="Snapshot", sensitive=False)
+        self.snap_btn.add_css_class("suggested-action")
+        self.snap_btn.connect("clicked", lambda *_: self.dialog_snapshot())
+        head.pack_end(self.snap_btn)
+        self.spinner = Gtk.Spinner()
+        head.pack_end(self.spinner)
+        view.add_top_bar(head)
+
+        # Shown when a drop-in file is broken; the details go to the command log.
+        self.banner = Adw.Banner(revealed=False)
+        view.add_top_bar(self.banner)
+
+        # Scrollable details for the selected volume
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        sc = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        clamp = Adw.Clamp(maximum_size=900, tightening_threshold=600)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                            margin_top=18, margin_bottom=18, margin_start=12, margin_end=12)
+        clamp.set_child(self.body)
+        sc.set_child(clamp)
+        outer.append(sc)
+
+        # Collapsible log of the equivalent commands, warnings and errors
+        self.log_buf = Gtk.TextBuffer()
+        self.log_view = Gtk.TextView(buffer=self.log_buf, editable=False, monospace=True,
+                                     wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=6,
+                                     bottom_margin=6, left_margin=8, right_margin=8)
+        log_sc = Gtk.ScrolledWindow(min_content_height=120, max_content_height=160)
+        log_sc.set_child(self.log_view)
+        exp = Gtk.Expander(label="Command log (equivalent btrfs commands)", margin_start=12,
+                           margin_end=12, margin_bottom=8)
+        exp.set_child(log_sc)
+        outer.append(exp)
+        view.set_content(outer)
+        self.split.set_content(Adw.NavigationPage(title="Snapshots", child=view))
+
+    # ------------------------------------------------------------------ plumbing
+
+    def set_busy(self, on):
+        """Spinner on, and Snapshot disabled, while a helper call is running."""
+        self.busy += 1 if on else -1
+        self.spinner.set_spinning(self.busy > 0)
+        v = self._vol()
+        self.snap_btn.set_sensitive(self.busy == 0 and bool(v and not v["error"]))
+
+    def log(self, text):
+        self.log_buf.insert(self.log_buf.get_end_iter(), f"[{dt.datetime.now():%H:%M:%S}] {text}\n")
+        self.log_view.scroll_to_iter(self.log_buf.get_end_iter(), 0, False, 0, 0)
+
+    def toast(self, text, timeout=4):
+        self.toasts.add_toast(Adw.Toast(title=esc(text), timeout=timeout))
+
+    def call(self, mode, args, on_ok=None, on_err=None):
+        """Run a helper, log what it did, then call on_ok(result) or on_err(response).
+
+        on_err can return True to say it handled the error itself (no toast).
+        """
+        self.set_busy(True)
+
+        def cb(res):
+            self.set_busy(False)
+            result = (res.get("result") or {}) if res.get("ok") else {}
+            for c in res.get("commands", []):
+                self.log(c if c.startswith("#") else "$ " + c)   # "# ..." lines are notes
+            for w in res.get("warnings", []):
+                self.log("warning: " + w)
+                self.toast(w, 8)
+            for n in result.get("notes", []):
+                self.log("note: " + n)
+            for h in result.get("hooks", []):
+                self.log(f"hook rc={h['rc']}: {' '.join(h['argv'])} {h['stderr'].strip()}".rstrip())
+            if res.get("ok"):
+                if on_ok:
+                    on_ok(res["result"])
+                return
+            if not res.get("cancelled"):
+                self.log("error: " + res.get("error", "unknown"))
+            if on_err and on_err(res):
+                return
+            self.toast(res.get("error", "unknown error"), 8)
+
+        self.helper.run(mode, args, cb)
+
+    def _vol(self):
+        """The selected volume's data, or None."""
+        if not self.data or self.current is None:
+            return None
+        return next((v for v in self.data["volumes"] if v["name"] == self.current), None)
+
+    # ------------------------------------------------------------------ loading and display
+
+    def refresh(self):
+        def ok(result):
+            self.data = result
+            self.new_btn.set_visible(bool(result.get("create_parents")))
+            # Broken drop-ins: show a banner, and list the details in the log
+            errs = result.get("config_errors", [])
+            for e in errs:
+                self.log("config: " + e)
+            self.banner.set_title(f"{len(errs)} config file(s) could not be loaded. "
+                                  "See the command log." if errs else "")
+            self.banner.set_revealed(bool(errs))
+            self.populate_sidebar()
+        self.call("query", ["list"], ok)
+
+    def populate_sidebar(self):
+        """Rebuild the volume list, keeping the current selection if it still exists."""
+        keep = self.current
+        while (row := self.vol_list.get_row_at_index(0)) is not None:
+            self.vol_list.remove(row)
+        select = None
+        for v in self.data["volumes"]:
+            row = Gtk.ListBoxRow()
+            row.vol_name = v["name"]
+            box = Gtk.Box(spacing=8, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+            box.append(Gtk.Image(icon_name="dialog-warning-symbolic" if v["error"]
+                                 else "drive-harddisk-symbolic"))
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+            text.append(Gtk.Label(label=v["name"], xalign=0))
+            sub = Gtk.Label(label="error" if v["error"] else f"{len(v['snapshots'])} snapshots",
+                            xalign=0)
+            sub.add_css_class("dim-label")
+            sub.add_css_class("caption")
+            text.append(sub)
+            box.append(text)
+            row.set_child(box)
+            self.vol_list.append(row)
+            if select is None or v["name"] == keep:
+                select = row
+        if select is None:
+            self.current = None
+            self.show_empty()
+        else:
+            self.vol_list.select_row(select)   # fires row-selected -> populate_content
+
+    def on_volume_selected(self, _lb, row):
+        if row is None:
+            return
+        changed = self.current != row.vol_name
+        self.current = row.vol_name
+        self.populate_content()
+        if changed:
+            self.split.set_show_content(True)   # on a narrow window, jump to the content pane
+
+    def _clear_body(self):
+        while (c := self.body.get_first_child()) is not None:
+            self.body.remove(c)
+
+    def show_empty(self):
+        self._clear_body()
+        self.title.set_title("Btrfs Snapshots")
+        self.title.set_subtitle("")
+        self.remove_btn.set_visible(False)
+        self.body.append(Adw.StatusPage(
+            icon_name="drive-harddisk-symbolic", title="No volumes configured",
+            description="Use New volume (+), or add [[volume]] entries to "
+                        "/etc/btrfs-snapman/config.toml"))
+
+    def populate_content(self):
+        """Right pane for the selected volume: source details, then its snapshots."""
+        v = self._vol()
+        self._clear_body()
+        if v is None:
+            return
+        self.title.set_title(v["name"])
+        self.title.set_subtitle(v["path"])
+        self.snap_btn.set_sensitive(self.busy == 0 and not v["error"])
+        self.remove_btn.set_visible(v["removable"])
+
+        # A volume that can't be read (missing folder, not a subvolume, …)
+        if v["error"]:
+            page = Adw.StatusPage(icon_name="dialog-warning-symbolic",
+                                  title="Volume unavailable", description=esc(v["error"]))
+            self.body.append(page)
+            self.body.append(self._origin_group(v))
+            return
+
+        # Source subvolume details
+        s = v["source"]
+        g = Adw.PreferencesGroup(title="Source subvolume")
+        g.add(self._info_row("Path", v["path"]))
+        g.add(self._info_row("Snapshot directory", v["snapshot_dir"]))
+        g.add(self._info_row("Subvolume", f"ID {s['id']} · {s['uuid']}"))
+        flags = (["NOCOW (chattr +C)"] if s.get("nocow") else []) + \
+                (["read-only"] if s["read_only"] else [])
+        if flags:
+            row = self._info_row("Attributes", " · ".join(flags))
+            if s.get("nocow"):
+                row.set_tooltip_text("NOCOW: no checksums or compression. After a snapshot, the "
+                                     "first write to each extent is copied, so VM images fragment.")
+                row.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+            g.add(row)
+        hooks = v["hooks"]
+        if hooks["pre_snapshot"] or hooks["post_snapshot"]:
+            desc = "; ".join(" ".join(h) for h in hooks["pre_snapshot"]) or "—"
+            desc += "  →  " + ("; ".join(" ".join(h) for h in hooks["post_snapshot"]) or "—")
+            g.add(self._info_row("Snapshot hooks", desc))
+        self.body.append(g)
+
+        # Snapshot list
+        snaps = v["snapshots"]
+        sg = Adw.PreferencesGroup(title=f"Snapshots ({len(snaps)})",
+                                  description="Newest first. Subvolumes directly inside the "
+                                              "snapshot directory, including ones made by hand.")
+        if not snaps:
+            sg.add(Adw.ActionRow(title="No snapshots yet", subtitle="Use the Snapshot button"))
+        for snap in snaps:
+            sg.add(self._snap_row(v, snap))
+        self.body.append(sg)
+
+        self.body.append(self._origin_group(v))
+
+    def _origin_group(self, v):
+        """Where this volume is defined: config.toml (hand-edited) or a drop-in (GUI-managed)."""
+        g = Adw.PreferencesGroup(title="Registration")
+        if v["origin"] == "dropin":
+            g.add(self._info_row("Managed by btrfs-snapman", v["origin_file"]))
+        else:
+            g.add(self._info_row("Defined by hand (remove it there)", v["origin_file"]))
+        return g
+
+    def _info_row(self, title, value):
+        """A read-only 'title over value' row whose value can be selected and copied."""
+        row = Adw.ActionRow(title=esc(title), subtitle=esc(value))
+        row.set_subtitle_selectable(True)
+        row.add_css_class("property")
+        return row
+
+    def _snap_row(self, v, snap):
+        """One snapshot: name, details, and buttons for open / copy / read-only / delete."""
+        bits = [fmt_time(snap["otime"]), fmt_age(snap["otime"]), f"ID {snap['id']}",
+                "RO" if snap["read_only"] else "RW"]
+        if not snap["of_source"]:
+            bits.append("not from this source")
+        if snap["received"]:
+            bits.append("received")
+        if snap["mounted"]:
+            bits.append("mounted")
+        row = Adw.ActionRow(title=esc(snap["name"]), subtitle=" · ".join(bits))
+
+        def btn(icon, tip, cb, css=None, sensitive=True):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER,
+                           sensitive=sensitive)
+            b.add_css_class("flat")
+            if css:
+                b.add_css_class(css)
+            b.connect("clicked", lambda *_: cb())
+            row.add_suffix(b)
+
+        # Snapshot names the helper won't accept are listed but not editable
+        manage = snap["manageable"]
+        btn("document-open-symbolic", "Open in Files", lambda: self.open_folder(snap["path"]))
+        btn("edit-copy-symbolic", "Copy path", lambda: self.copy(snap["path"]))
+
+        # Read-only switch. Block GTK's own flip; the refresh after the helper call
+        # sets the real state (so a cancelled password prompt leaves it unchanged).
+        sw = Gtk.Switch(active=snap["read_only"], valign=Gtk.Align.CENTER, sensitive=manage,
+                        tooltip_text="Read-only", margin_start=6, margin_end=6)
+        sw.connect("state-set", lambda _s, _st: (self.toggle_ro(v, snap), True)[1])
+        row.add_suffix(sw)
+
+        btn("edit-delete-symbolic", "Delete…", lambda: self.dialog_delete(v, snap),
+            css="error", sensitive=manage and not snap["mounted"])
+        return row
+
+    # ------------------------------------------------------------------ snapshot actions
+
+    def open_folder(self, path):
+        launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(path))
+
+        def done(lch, res):
+            try:
+                lch.launch_finish(res)
+            except GLib.Error as e:
+                self.toast(f"Could not open: {e.message}")
+        launcher.launch(self, None, done)
+
+    def copy(self, text):
+        self.get_clipboard().set_content(Gdk.ContentProvider.new_for_value(text))
+        self.toast("Path copied")
+
+    def toggle_ro(self, v, snap, force=False):
+        """Flip read-only. Received snapshots get a second confirmation before going writable."""
+        target = "false" if snap["read_only"] else "true"
+        args = ["set-ro", v["name"], snap["name"], target] + (["--force"] if force else [])
+
+        def err(res):
+            if "RECEIVED_SNAPSHOT" in res.get("error", "") and not force:
+                d = Adw.AlertDialog(
+                    heading="Make received snapshot writable?",
+                    body=f"“{snap['name']}” was created by btrfs receive. Making it writable "
+                         "breaks incremental send chains that use it as a parent.")
+                d.add_response("cancel", "Cancel")
+                d.add_response("force", "Make writable")
+                d.set_response_appearance("force", Adw.ResponseAppearance.DESTRUCTIVE)
+                d.connect("response", lambda _d, r: r == "force" and self.toggle_ro(v, snap, True))
+                d.present(self)
+                return True
+            return False
+
+        self.call("admin", args, lambda _r: self.refresh(), err)
+
+    def dialog_snapshot(self):
+        """Comment, live name preview, read-only switch, plus hook/NOCOW notes."""
+        v = self._vol()
+        if not v:
+            return
+        d = Adw.AlertDialog(heading=f"Snapshot “{v['name']}”",
+                            body=f"{v['path']}  →  {v['snapshot_dir']}/")
+        grp = Adw.PreferencesGroup()
+        label = Adw.EntryRow(title="Comment (optional)", activates_default=True)
+        preview = Adw.ActionRow(title="Name", subtitle=esc(preview_name(v, "")))
+        preview.set_subtitle_selectable(True)
+        ro = Adw.SwitchRow(title="Read-only", active=v["default_read_only"])
+        for w in (label, preview, ro):
+            grp.add(w)
+        if v["hooks"]["pre_snapshot"]:
+            grp.add(Adw.ActionRow(title="Hooks will run", subtitle=esc(
+                "; ".join(" ".join(h) for h in v["hooks"]["pre_snapshot"]))))
+        if v["source"].get("nocow"):
+            grp.add(Adw.ActionRow(title="Source is NOCOW",
+                                  subtitle="Running VMs give a crash-consistent snapshot only, "
+                                           "unless hooks freeze them"))
+        d.set_extra_child(grp)
+        d.add_response("cancel", "Cancel")
+        d.add_response("snap", "Snapshot")
+        d.set_response_appearance("snap", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("snap")
+
+        label.connect("changed", lambda *_: preview.set_subtitle(
+            esc(preview_name(v, sanitise_label(label.get_text())))))
+
+        def resp(_d, r):
+            if r == "snap":
+                self._do_snapshot(v, sanitise_label(label.get_text()), ro.get_active())
+        d.connect("response", resp)
+        d.present(self)
+        label.grab_focus()
+
+    def _do_snapshot(self, v, label, ro):
+        args = ["snapshot", v["name"]] + ([label] if label else []) + (["--ro"] if ro else ["--rw"])
+
+        def ok(r):
+            self.toast(f"Created {r['name']}")
+            self.refresh()
+
+        def err(_r):
+            self.refresh()      # a failed hook may still have changed things; reload
+            return False
+        self.call("admin", args, ok, err)
+
+    def dialog_delete(self, v, snap):
+        """Delete one snapshot; the button stays disabled until the word 'delete' is typed."""
+        d = Adw.AlertDialog(heading="Delete snapshot?",
+                            body=f"{snap['name']}\n\nType delete to confirm.")
+        entry = Gtk.Entry(activates_default=True)
+        d.set_extra_child(entry)
+        d.add_response("cancel", "Cancel")
+        d.add_response("delete", "Delete")
+        d.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_response_enabled("delete", False)
+        d.set_default_response("delete")     # Enter works, but only once the button is enabled
+        d.set_close_response("cancel")
+        # Case and surrounding spaces don't matter: "Delete", " delete " are fine
+        entry.connect("changed", lambda e: d.set_response_enabled(
+            "delete", e.get_text().strip().lower() == "delete"))
+
+        def resp(_d, r):
+            if r == "delete":
+                self.call("admin", ["delete", v["name"], snap["name"]],
+                          lambda _r: (self.toast(f"Deleted {snap['name']}"), self.refresh()))
+        d.connect("response", resp)
+        d.present(self)
+        entry.grab_focus()
+
+    # ------------------------------------------------------------------ volume management
+
+    def dialog_new_volume(self):
+        """Create (or register an existing) subvolume under a configured parent."""
+        parents = self.data.get("create_parents", [])
+        d = Adw.AlertDialog(heading="New volume",
+                            body="Creates a subvolume and its snapshot folder, and registers it. "
+                                 "Asks for your password every time.")
+        grp = Adw.PreferencesGroup()
+        parent = Adw.ComboRow(title="Parent",
+                              model=Gtk.StringList.new([p["path"] for p in parents]))
+        name = Adw.EntryRow(title="Name (used in snapshot names)", activates_default=True)
+        folder = Adw.EntryRow(title="Folder name (optional, defaults to Name)")
+        existing = Adw.SwitchRow(title="Use existing subvolume",
+                                 subtitle="Register a subvolume that's already there")
+        nocow = Adw.SwitchRow(title="NOCOW (chattr +C)",
+                              subtitle="For VM disk images: less fragmentation, "
+                                       "but no checksums or compression")
+        result = Adw.ActionRow(title="Will create")
+        result.set_subtitle_selectable(True)
+        for w in (parent, name, folder, existing, nocow, result):
+            grp.add(w)
+        d.set_extra_child(grp)
+        d.add_response("cancel", "Cancel")
+        d.add_response("create", "Create")
+        d.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("create")
+
+        # Keep the preview, the button label and the validity check in sync with the inputs
+        def update(*_):
+            p = parents[parent.get_selected()] if parents else None
+            fol = folder.get_text() or name.get_text()
+            ok = bool(p) and bool(NAME_RE.match(name.get_text())) and bool(NAME_RE.match(fol))
+            nocow.set_sensitive(not existing.get_active())
+            if existing.get_active():
+                nocow.set_active(False)
+            d.set_response_label("create", "Register" if existing.get_active() else "Create")
+            d.set_response_enabled("create", ok)
+            if p and fol:
+                what = "Register" if existing.get_active() else "Subvolume"
+                result.set_subtitle(esc(f"{what}: {p['path']}/{fol}\n"
+                                        f"Snapshots: {p['snapshot_root']}/{fol}/"))
+            else:
+                result.set_subtitle("—")
+        for w, sig in ((parent, "notify::selected"), (name, "changed"), (folder, "changed"),
+                       (existing, "notify::active")):
+            w.connect(sig, update)
+        update()
+
+        def resp(_d, r):
+            if r != "create":
+                return
+            p = parents[parent.get_selected()]
+            vname = name.get_text()
+            args = ["new-volume", vname, p["path"], folder.get_text() or vname]
+            args += (["--nocow"] if nocow.get_active() else [])
+            args += (["--existing"] if existing.get_active() else [])
+
+            def ok(res):
+                self.toast(f"Volume {res['name']} ready")
+                self.current = res["name"]      # select it after the refresh
+                self.refresh()
+            self.call("manage", args, ok)
+        d.connect("response", resp)
+        d.present(self)
+        name.grab_focus()
+
+    def dialog_remove_volume(self):
+        """Unregister a GUI-managed volume, optionally deleting its data and snapshots."""
+        v = self._vol()
+        if not v or not v["removable"]:
+            return
+        nsnaps = len(v["snapshots"])
+        d = Adw.AlertDialog(heading=f"Remove volume “{v['name']}”?")
+        grp = Adw.PreferencesGroup()
+
+        # Deleting data is only possible for subvolumes directly under a create parent
+        can_delete = v["data_deletable"] and not v["error"]
+        delete = Adw.SwitchRow(title="Delete the subvolume and its data",
+                               subtitle=esc(v["path"]) if can_delete else
+                               "Not available: only subvolumes created under a configured "
+                               "parent can be deleted here", sensitive=can_delete)
+        final = Adw.SwitchRow(title="Take a final read-only snapshot first",
+                              subtitle="Keeps the data until you delete that snapshot too",
+                              active=True)
+        snaps = Adw.SwitchRow(title=f"Also delete its {nsnaps} snapshot(s) and the snapshot folder",
+                              subtitle=esc(v["snapshot_dir"]))
+        summary = Adw.ActionRow(title="What will happen")
+        confirm = Adw.EntryRow(title=f"Type {v['name']} to confirm")
+        for w in (delete, final, snaps, summary, confirm):
+            grp.add(w)
+        d.set_extra_child(grp)
+        d.add_response("cancel", "Cancel")
+        d.add_response("remove", "Unregister")
+        d.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_close_response("cancel")
+
+        # Work out which options make sense together, and describe the outcome in plain words
+        def update(*_):
+            deleting = delete.get_active()
+            final.set_sensitive(deleting and not snaps.get_active())
+            snaps.set_sensitive(deleting)
+            if not deleting:
+                snaps.set_active(False)
+            if snaps.get_active():
+                final.set_active(False)
+            if not deleting:
+                text = "Only the registration is removed. Nothing on disk changes."
+            elif snaps.get_active():
+                text = (f"The subvolume, all {nsnaps} snapshot(s) and the snapshot folder are "
+                        "deleted. Nothing is kept.")
+            elif final.get_active():
+                text = ("A final read-only snapshot is taken, then the subvolume is deleted. "
+                        f"Snapshots stay in {v['snapshot_dir']} but are no longer listed here.")
+            else:
+                text = (f"The subvolume is deleted. Snapshots stay in {v['snapshot_dir']} "
+                        "but are no longer listed here.")
+            summary.set_subtitle(esc(text))
+            d.set_response_label("remove", "Delete" if deleting else "Unregister")
+            d.set_response_enabled("remove", confirm.get_text() == v["name"])
+        for w, sig in ((delete, "notify::active"), (final, "notify::active"),
+                       (snaps, "notify::active"), (confirm, "changed")):
+            w.connect(sig, update)
+        update()
+
+        def resp(_d, r):
+            if r != "remove":
+                return
+            args = ["remove-volume", v["name"]]
+            if delete.get_active():
+                args.append("--delete-data")
+                if snaps.get_active():
+                    args.append("--delete-snapshots")
+                elif not final.get_active():
+                    args.append("--no-final-snapshot")
+
+            def ok(res):
+                msg = f"Removed {v['name']}"
+                if res.get("final_snapshot"):
+                    msg += f"; final snapshot kept at {res['final_snapshot']}"
+                self.toast(msg, 8)
+                self.current = None
+                self.refresh()
+            self.call("manage", args, ok)
+        d.connect("response", resp)
+        d.present(self)
+        confirm.grab_focus()
+
+
+# =========================================================================== app entry
+
+class App(Adw.Application):
+    def __init__(self, helper):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.helper = helper
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self, self.helper)
+        win.present()
+
+
+def main():
+    # --no-pkexec and --libexec DIR are for testing only
+    args = sys.argv[1:]
+    use_pkexec = "--no-pkexec" not in args
+    libexec = args[args.index("--libexec") + 1] if "--libexec" in args else LIBEXEC
+    app = App(Helper(use_pkexec, libexec))
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

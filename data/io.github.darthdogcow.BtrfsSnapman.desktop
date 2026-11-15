@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Btrfs Snapshots
+Comment=Manage btrfs subvolume snapshots
+Exec=btrfs-snapman
+Icon=drive-harddisk
+Terminal=false
+Categories=System;Utility;
+Keywords=btrfs;snapshot;subvolume;backup;

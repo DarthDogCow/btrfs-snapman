@@ -1,0 +1,41 @@
+.TH BTRFS-SNAPMAN 1 "November 2026" "btrfs-snapman 0.5.0" "User Commands"
+.SH NAME
+btrfs-snapman \- GTK4 manager for btrfs subvolume snapshots
+.SH SYNOPSIS
+.B btrfs-snapman
+.SH DESCRIPTION
+.B btrfs-snapman
+lists the volumes defined in
+.I /etc/btrfs-snapman
+and the snapshots in each volume's snapshot folder.
+It can create and delete snapshots, toggle their read-only flag, and create or
+remove volumes.
+.PP
+The GUI runs as the calling user.
+Every operation goes through
+.BR pkexec (1)
+to a root helper in
+.IR /usr/libexec/btrfs-snapman ,
+each governed by its own polkit action:
+listing needs no password for the active local session, snapshot changes ask
+for an administrator password (cached for a few minutes), and creating or
+removing a volume asks every time.
+.SH FILES
+.TP
+.I /etc/btrfs-snapman/config.toml
+Shared settings, hand-defined volumes and the parents under which new volumes
+may be created.
+Must be owned by root and not group- or world-writable.
+The program never modifies it.
+.TP
+.I /etc/btrfs-snapman/volumes.d/<name>.toml
+One file per volume created in the GUI.
+.TP
+.I /usr/share/doc/btrfs-snapman/examples/config.example.toml
+Annotated example configuration.
+.SH SEE ALSO
+.BR btrfs-subvolume (8),
+.BR pkexec (1),
+.BR journalctl (1)
+.PP
+Changes are logged to the journal: \fBjournalctl \-t btrfs-snapman\fR.

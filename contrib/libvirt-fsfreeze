@@ -1,0 +1,22 @@
+#!/bin/bash
+# Freeze/thaw guest filesystems around a snapshot (libvirt system instance).
+# Needs qemu-guest-agent running in each guest.
+# Usage: libvirt-fsfreeze freeze|thaw [DOMAIN...]   (no domains = all running)
+# Freeze: exits non-zero if any running domain fails to freeze (snapshot is aborted).
+# Thaw:   always tries every domain; exits non-zero if any thaw fails.
+set -u
+action=${1:-}; shift || true
+case "$action" in freeze|thaw) ;; *) echo "usage: $0 freeze|thaw [DOMAIN...]" >&2; exit 2;; esac
+VIRSH="/usr/bin/virsh -c qemu:///system"
+# Which domains: the ones named on the command line, or every running one.
+if [ $# -eq 0 ]; then mapfile -t doms < <($VIRSH list --name --state-running | sed '/^$/d')
+else doms=("$@"); fi
+# Freeze/thaw each running domain; stopped domains don't need it.
+rc=0
+for d in "${doms[@]}"; do
+  state=$($VIRSH domstate "$d" 2>/dev/null)
+  [ "$state" = "running" ] || { echo "$d: $state, skipping"; continue; }
+  if out=$($VIRSH "domfs$action" "$d" 2>&1); then echo "$d: ${action} ok"
+  else echo "$d: $action FAILED: $out" >&2; rc=1; fi
+done
+exit $rc

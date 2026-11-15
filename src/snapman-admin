@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -IB
+# Snapshot entry point: snapshot / delete / set-ro.
+# Polkit asks for the admin password, then caches it for a few minutes.
+import sys
+sys.path.insert(0, "/usr/lib/btrfs-snapman")
+import snapman_core
+sys.exit(snapman_core.main("admin", sys.argv[1:]))

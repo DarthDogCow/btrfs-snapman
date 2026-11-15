@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -IB
+# Read-only entry point: "list" only.
+# Polkit allows this without a password for the active local session.
+import sys
+sys.path.insert(0, "/usr/lib/btrfs-snapman")
+import snapman_core
+sys.exit(snapman_core.main("query", sys.argv[1:]))

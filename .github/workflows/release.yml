@@ -1,0 +1,37 @@
+# Build the .deb on v* tags and attach it to the GitHub release.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: btrfs-snapman
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends debhelper lintian
+
+      - name: Check the tag matches debian/changelog
+        working-directory: btrfs-snapman
+        run: |
+          version=$(dpkg-parsechangelog -S Version)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != changelog $version"; exit 1; }
+
+      - name: Build
+        working-directory: btrfs-snapman
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Lintian
+        run: lintian --fail-on error,warning *.changes
+
+      - name: Create release and attach the .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" btrfs-snapman_*_all.deb --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

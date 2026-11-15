@@ -1,0 +1,6 @@
+btrfs-snapman (0.5.0) noble; urgency=medium
+
+  * Package as a .deb; install under /usr instead of /usr/local.
+  * Rename the app ID and polkit actions to io.github.darthdogcow.BtrfsSnapman.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Sun, 15 Nov 2026 10:04:19 +0000
