@@ -138,7 +138,7 @@ Then use **New volume → Use existing subvolume** with the same folder name (or
 
 ## VM disk notes
 - A snapshot of a running VM's disk is **crash-consistent only**, the same as pulling the power.
-- `libvirt-fsfreeze` (installed in `/usr/libexec/btrfs-snapman/`) freezes and thaws guest filesystems through `virsh` on `qemu:///system`. It needs `qemu-guest-agent` in each guest. It does **not** see GNOME Boxes or other `qemu:///session` VMs.
+- `libvirt-fsfreeze` (installed in `/usr/libexec/btrfs-snapman/`) freezes and thaws guest filesystems through `virsh` on `qemu:///system`, so it needs `libvirt-clients` (suggested, not installed automatically; a libvirt host normally has it already). It needs `qemu-guest-agent` in each guest. It does **not** see GNOME Boxes or other `qemu:///session` VMs.
 - NOCOW (`chattr +C`) reduces fragmentation for VM images, but turns off checksums and compression for those files. After a snapshot, the first write to each extent is copied anyway. It can only be set on an empty folder, which is why it's offered in New volume.
 
 ## Tests

@@ -5,7 +5,8 @@ btrfs-snapman (0.7.0) noble; urgency=medium
     as root). Volume and location changes ask for the password every time.
   * Split into three packages: btrfs-snapman-common (helpers, config,
     shared modules), btrfs-snapman (GTK) and btrfs-snapman-cli, so headless
-    machines install no GTK or polkit.
+    machines install no GTK or polkit. libvirt-clients, needed only by
+    the libvirt-fsfreeze hook, is now suggested rather than recommended.
   * Code shared by both front ends moves to snapman_client.py.
   * The journal names the caller via SUDO_UID as well as PKEXEC_UID.
   * install.sh --cli installs the terminal interface only.

@@ -14,8 +14,8 @@ Architecture: all
 Depends: python3,
          python3-btrfsutil,
          ${misc:Depends}
-Recommends: btrfs-progs, libvirt-clients
-Suggests: btrfs-snapman | btrfs-snapman-cli
+Recommends: btrfs-progs
+Suggests: btrfs-snapman | btrfs-snapman-cli, libvirt-clients
 Breaks: btrfs-snapman (<< 0.7.0)
 Replaces: btrfs-snapman (<< 0.7.0)
 Description: btrfs subvolume snapshot manager - root helpers and config
