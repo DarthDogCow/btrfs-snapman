@@ -113,7 +113,7 @@ sudo apt install ./btrfs-snapman-common_<version>_all.deb ./btrfs-snapman-cli_<v
 | `/etc/btrfs-snapman/volumes.d/` | one file per volume created with the tool; owned by the package, contents never touched |
 | `/etc/btrfs-snapman/parents.d/` | one file per approved location; likewise |
 
-**Upgrading:** pull and run `sudo ./install.sh` again (with `--cli` on headless machines). Your `config.toml` is kept; if the packaged example changed, the new one is saved next to it as `config.toml.dpkg-dist`. The annotated example is always at `/usr/share/doc/btrfs-snapman-common/examples/config.example.toml`. Upgrading from 0.6.0, where one `btrfs-snapman` package held everything, moves the config to `btrfs-snapman-common` without a prompt and leaves `volumes.d` and `parents.d` alone.
+**Upgrading:** pull and run `sudo ./install.sh` again (with `--cli` on headless machines). Your `config.toml` is kept; if the packaged example changed, the new one is saved next to it as `config.toml.dpkg-dist`. Installing the `.deb`s with `apt` directly, dpkg asks instead when you have edited `config.toml` and the example changed: answer N to keep yours. The annotated example is always at `/usr/share/doc/btrfs-snapman-common/examples/config.example.toml`. Upgrading from 0.6.0, where one `btrfs-snapman` package held everything, moves the config to `btrfs-snapman-common` without a prompt and leaves `volumes.d` and `parents.d` alone.
 
 **Removing:** `sudo ./install.sh --uninstall` (or `sudo apt remove btrfs-snapman btrfs-snapman-cli btrfs-snapman-common`) keeps `/etc/btrfs-snapman`. Purging `btrfs-snapman-common` deletes `config.toml` too, but leaves your `volumes.d/*.toml` and `parents.d/*.toml` files. Versions before 0.5.0 were copied into `/usr/local`; `install.sh` removes that copy in either mode.
 
@@ -181,7 +181,7 @@ These three create and remove users, packages or `/etc` files, so run them **onl
 | Test | What it covers |
 |---|---|
 | `sudo tests/test_sudo.sh` | with the packages installed: the first `sudo -v`, timestamp reuse and expiry, manage verbs asking every time, a wrong password (exit 3), the TUI stepping aside for sudo, the sudoers example, and that the password never shows in the process list |
-| `sudo tests/test_upgrade.sh OLD.deb NEW_DIR` | 0.6.0 (one package) → the split packages: an edited `config.toml` survives byte-identical with no prompt and no `.dpkg-*` files, `volumes.d` is untouched, and `btrfs-snapman-common` owns the conffile |
+| `sudo tests/test_upgrade.sh OLD.deb NEW_DIR` | 0.6.0 (one package) → the split packages: an edited `config.toml` survives byte-identical (the new example, if it changed, saved as `.dpkg-dist`), `volumes.d` is untouched, `btrfs-snapman-common` owns the conffile, and an untouched `config.toml` is updated with no prompt |
 | `tests/test_headless.sh NEW_DIR` | installing common + CLI pulls in no GTK, gir, pkexec or polkit |
 
 Build the packages with `dpkg-buildpackage -us -uc -b` and check them with `lintian --fail-on error,warning *.changes`. For the upgrade test, build the 0.6.0 package from its tag: `git archive --prefix=btrfs-snapman/ v0.6.0 | tar x -C /tmp`, then `dpkg-buildpackage -us -uc -b` in `/tmp/btrfs-snapman`.

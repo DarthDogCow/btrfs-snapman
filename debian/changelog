@@ -5,6 +5,10 @@ btrfs-snapman (0.8.1) noble; urgency=medium
     folders are now recognised by timestamp-only names made in the first
     seconds of a minute. The name prefix of such snapshots is kept.
   * discover --all also suggests for configured volumes, to compare.
+  * The shipped config.toml no longer defines the two example volumes;
+    they are kept as comments. A fresh install starts with no volumes,
+    ready for discover. An edited config.toml is kept: dpkg asks about
+    the changed example, and install.sh keeps yours without asking.
 
  -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Tue, 17 Nov 2026 11:51:31 +0000
 

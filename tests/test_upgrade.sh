@@ -4,8 +4,10 @@
 # Usage: tests/test_upgrade.sh OLD.deb NEW_DIR
 #   OLD.deb   btrfs-snapman_0.6.0_all.deb, built from the v0.6.0 commit
 #   NEW_DIR   the folder with the three new .debs
-# Checks that an edited config.toml and a volumes.d file survive with no prompt and no
-# .dpkg-* leftovers, and that btrfs-snapman-common owns the conffile afterwards.
+# 1. An edited config.toml and a volumes.d file survive the move to btrfs-snapman-common,
+#    which owns the conffile afterwards. If the packaged example changed since 0.6.0, dpkg
+#    asks about it; the answer "keep yours" is given the way install.sh gives it.
+# 2. An untouched config.toml is replaced by the new example with no prompt at all.
 set -u
 OLD=$(realpath "$1"); NEW=$(realpath "$2")
 V=$(dpkg-deb -f "$NEW"/btrfs-snapman-common_*_all.deb Version)
@@ -16,7 +18,19 @@ assert() {
   if "$@"; then pass=$((pass+1)); echo "PASS  $desc"; else fail=$((fail+1)); echo "FAIL  $desc"; fi
 }
 export DEBIAN_FRONTEND=noninteractive
+clean() {
+  apt-get purge -y -q btrfs-snapman btrfs-snapman-cli btrfs-snapman-common </dev/null >/dev/null 2>&1
+  rm -rf "$ETC"
+}
+# The new packaged example, and whether it differs from 0.6.0's
+dpkg-deb -x "$NEW"/btrfs-snapman-common_"$V"_all.deb "$NEW/x-new"
+dpkg-deb -x "$OLD" "$NEW/x-old"
+new_example=$(sha256sum < "$NEW/x-new$ETC/config.toml")
+changed=$(cmp -s "$NEW/x-new$ETC/config.toml" "$NEW/x-old$ETC/config.toml" || echo yes)
+rm -rf "$NEW/x-new" "$NEW/x-old"
 
+# ---------------------------------------------------------------- 1. edited config
+clean
 apt-get install -y -q "$OLD" >/dev/null 2>&1
 assert "0.6.0 installed"                      eval '[ "$(dpkg-query -W -f="\${Version}" btrfs-snapman)" = 0.6.0 ]'
 # Edit the conffile the way an admin would, and add a GUI-style drop-in
@@ -25,13 +39,19 @@ printf '[volume]\nname = "keep"\npath = "/srv/keep"\nsnapshot_dir = "/srv/snapsh
   > "$ETC/volumes.d/keep.toml"
 before_cfg=$(sha256sum < "$ETC/config.toml"); before_vol=$(sha256sum < "$ETC/volumes.d/keep.toml")
 
-# No --force-conf* options, and no terminal: a conffile prompt would fail the install.
-apt-get install -y -q "$NEW"/btrfs-snapman*_"$V"_all.deb </dev/null >"$NEW/upgrade.log" 2>&1
-assert "upgrade succeeded without a prompt"   [ $? -eq 0 ]
-assert "  no conffile question in the log"    eval '! grep -qi "configuration file" "$NEW/upgrade.log"'
+# No terminal. Only when the example changed is there a question to answer at all.
+opts=(); [ -n "$changed" ] && opts=(-o Dpkg::Options::=--force-confold)
+apt-get install -y -q "${opts[@]}" "$NEW"/btrfs-snapman*_"$V"_all.deb </dev/null >"$NEW/upgrade.log" 2>&1
+assert "upgrade succeeded"                    [ $? -eq 0 ]
 assert "  all three $V packages installed" [ "$(dpkg-query -W -f='${Version} ' btrfs-snapman btrfs-snapman-common btrfs-snapman-cli)" = "$V $V $V " ]
 assert "config.toml byte-identical"           [ "$(sha256sum < "$ETC/config.toml")" = "$before_cfg" ]
-assert "no .dpkg-dist / .dpkg-old / .dpkg-new" eval '[ -z "$(find "$ETC" -name "*.dpkg-*")" ]'
+if [ -n "$changed" ]; then
+  assert "  new example saved as .dpkg-dist"  [ "$(sha256sum < "$ETC/config.toml.dpkg-dist")" = "$new_example" ]
+  assert "  no other .dpkg-* files"           [ "$(find "$ETC" -name '*.dpkg-*')" = "$ETC/config.toml.dpkg-dist" ]
+else
+  assert "  no conffile question in the log"  eval '! grep -qi "configuration file" "$NEW/upgrade.log"'
+  assert "  no .dpkg-* files"                 eval '[ -z "$(find "$ETC" -name "*.dpkg-*")" ]'
+fi
 assert "volumes.d file untouched"             [ "$(sha256sum < "$ETC/volumes.d/keep.toml")" = "$before_vol" ]
 assert "conffile owned by btrfs-snapman-common" [ "$(dpkg -S "$ETC/config.toml")" = "btrfs-snapman-common: $ETC/config.toml" ]
 # The GUI may keep an "obsolete" record of it (dpkg's normal trace of a moved conffile);
@@ -44,6 +64,14 @@ apt-get purge -y -q btrfs-snapman </dev/null >/dev/null 2>&1
 assert "purging the GUI keeps config.toml"    [ "$(sha256sum < "$ETC/config.toml")" = "$before_cfg" ]
 assert "  and volumes.d"                      [ -f "$ETC/volumes.d/keep.toml" ]
 assert "  CLI still installed"                eval 'dpkg-query -W -f="\${Status}" btrfs-snapman-cli | grep -q "install ok installed"'
+
+# ---------------------------------------------------------------- 2. untouched config
+clean
+apt-get install -y -q "$OLD" >/dev/null 2>&1
+apt-get install -y -q "$NEW"/btrfs-snapman*_"$V"_all.deb </dev/null >"$NEW/upgrade2.log" 2>&1
+assert "untouched config: upgrade with no options" [ $? -eq 0 ]
+assert "  now the new example"                [ "$(sha256sum < "$ETC/config.toml")" = "$new_example" ]
+assert "  no .dpkg-* files"                   eval '[ -z "$(find "$ETC" -name "*.dpkg-*")" ]'
 
 echo; echo "passed=$pass failed=$fail"
 [ $fail -eq 0 ]

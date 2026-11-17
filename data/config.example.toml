@@ -10,27 +10,30 @@ timestamp_format = "%Y%m%d-%H%M%S"
 read_only = true
 
 # Volumes can be defined here ([[volume]] blocks) or one per file in volumes.d/
-# (a [volume] table in <name>.toml). The GUI can only remove the volumes.d ones.
-# One [[volume]] per subvolume you snapshot. snapshot_dir must already exist and be on
-# the same btrfs filesystem. The GUI lists every subvolume directly inside snapshot_dir,
-# so snapshots you made by hand show up too. Deletes are confined to snapshot_dir.
+# (a [volume] table in <name>.toml). btrfs-snapman can only remove the volumes.d ones.
+# The easiest start is "btrfs-snapman-cli discover", which suggests a volume for each
+# subvolume it finds and registers them in volumes.d.
+# One [[volume]] per subvolume you snapshot. snapshot_dir must be on the same btrfs
+# filesystem. btrfs-snapman lists every subvolume directly inside snapshot_dir, so
+# snapshots you made by hand show up too. Deletes are confined to snapshot_dir.
+# Examples: remove one leading "# " from each line of a block to use it.
 
-[[volume]]
-name = "vm-images"
-path = "/var/lib/libvirt/images"
-snapshot_dir = "/snapshots/vm-images"
-# Optional hooks, run as root around the snapshot. Each is an argv list (no shell).
-# A failing pre hook aborts the snapshot; post hooks always run.
-# pre_snapshot  = [["/usr/libexec/btrfs-snapman/libvirt-fsfreeze", "freeze", "win11"]]
-# post_snapshot = [["/usr/libexec/btrfs-snapman/libvirt-fsfreeze", "thaw",   "win11"]]
+# [[volume]]
+# name = "vm-images"
+# path = "/var/lib/libvirt/images"
+# snapshot_dir = "/snapshots/vm-images"
+# # Optional hooks, run as root around the snapshot. Each is an argv list (no shell).
+# # A failing pre hook aborts the snapshot; post hooks always run.
+# # pre_snapshot  = [["/usr/libexec/btrfs-snapman/libvirt-fsfreeze", "freeze", "win11"]]
+# # post_snapshot = [["/usr/libexec/btrfs-snapman/libvirt-fsfreeze", "thaw",   "win11"]]
 
-[[volume]]
-name = "home"
-path = "/home"
-snapshot_dir = "/snapshots/home"
-# per-volume overrides:
-# name_format = "{volume}-{timestamp}-{label}"
-# read_only = false
+# [[volume]]
+# name = "home"
+# path = "/home"
+# snapshot_dir = "/snapshots/home"
+# # per-volume overrides:
+# # name_format = "{volume}-{timestamp}-{label}"
+# # read_only = false
 
 # Optional: where "New volume" in the GUI may create subvolumes, and where their
 # snapshots go (<snapshot_root>/<folder>). Volumes the GUI creates are written to
