@@ -1,0 +1,6 @@
+src/snapman_core.py         usr/lib/btrfs-snapman/
+src/snapman_client.py       usr/lib/btrfs-snapman/
+src/snapman-query           usr/libexec/btrfs-snapman/
+src/snapman-admin           usr/libexec/btrfs-snapman/
+src/snapman-manage          usr/libexec/btrfs-snapman/
+contrib/libvirt-fsfreeze    usr/libexec/btrfs-snapman/

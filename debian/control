@@ -9,22 +9,57 @@ Homepage: https://github.com/DarthDogCow/btrfs-snapman
 Vcs-Browser: https://github.com/DarthDogCow/btrfs-snapman
 Vcs-Git: https://github.com/DarthDogCow/btrfs-snapman.git
 
-Package: btrfs-snapman
+Package: btrfs-snapman-common
 Architecture: all
 Depends: python3,
          python3-btrfsutil,
+         ${misc:Depends}
+Recommends: btrfs-progs, libvirt-clients
+Suggests: btrfs-snapman | btrfs-snapman-cli
+Breaks: btrfs-snapman (<< 0.7.0)
+Replaces: btrfs-snapman (<< 0.7.0)
+Description: btrfs subvolume snapshot manager - root helpers and config
+ btrfs-snapman creates, lists and deletes btrfs snapshots of selected
+ subvolumes, with one snapshot folder per subvolume. It does not use Snapper
+ and does not impose a layout.
+ .
+ This package holds the parts both front ends share: three small root
+ helpers that do all privileged work, the configuration in /etc/btrfs-snapman
+ and the shared Python modules. The helpers only accept volume names from
+ root-owned configuration, plus folders the administrator approves as new
+ volume locations. Install btrfs-snapman (GTK) or btrfs-snapman-cli
+ (terminal) to use them.
+
+Package: btrfs-snapman
+Architecture: all
+Depends: btrfs-snapman-common (= ${binary:Version}),
+         python3,
          python3-gi,
          gir1.2-gtk-4.0,
          gir1.2-adw-1,
          pkexec,
          ${misc:Depends}
-Recommends: btrfs-progs, libvirt-clients
-Description: GTK4 manager for btrfs subvolume snapshots
- A small libadwaita GUI for creating, listing and deleting btrfs snapshots
- of selected subvolumes, with one snapshot folder per subvolume. It does not
- use Snapper and does not impose a layout.
+Description: btrfs subvolume snapshot manager - GTK4 interface
+ btrfs-snapman creates, lists and deletes btrfs snapshots of selected
+ subvolumes, with one snapshot folder per subvolume. It does not use Snapper
+ and does not impose a layout.
  .
- The GUI runs as the user. Every operation goes through pkexec to one of
- three small root helpers, each with its own polkit action. The helpers only
- accept volume names from root-owned configuration in /etc/btrfs-snapman,
- plus folders the administrator approves as new volume locations.
+ This package is the libadwaita GUI. It runs as the user; every operation
+ goes through pkexec to one of the root helpers in btrfs-snapman-common,
+ each with its own polkit action.
+
+Package: btrfs-snapman-cli
+Architecture: all
+Depends: btrfs-snapman-common (= ${binary:Version}),
+         python3,
+         sudo,
+         ${misc:Depends}
+Description: btrfs subvolume snapshot manager - terminal interface
+ btrfs-snapman creates, lists and deletes btrfs snapshots of selected
+ subvolumes, with one snapshot folder per subvolume. It does not use Snapper
+ and does not impose a layout.
+ .
+ This package is btrfs-snapman-cli: a full-screen curses interface and
+ scriptable subcommands, for SSH sessions and headless machines. It needs no
+ GTK or polkit; it reaches the root helpers in btrfs-snapman-common through
+ sudo, or directly when run as root (e.g. from cron).

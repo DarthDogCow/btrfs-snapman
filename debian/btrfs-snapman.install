@@ -1,0 +1,3 @@
+src/btrfs-snapman                                   usr/bin/
+data/io.github.darthdogcow.BtrfsSnapman.policy      usr/share/polkit-1/actions/
+data/io.github.darthdogcow.BtrfsSnapman.desktop     usr/share/applications/

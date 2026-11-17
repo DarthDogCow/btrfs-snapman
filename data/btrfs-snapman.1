@@ -1,4 +1,4 @@
-.TH BTRFS-SNAPMAN 1 "November 2026" "btrfs-snapman 0.6.0" "User Commands"
+.TH BTRFS-SNAPMAN 1 "November 2026" "btrfs-snapman 0.7.0" "User Commands"
 .SH NAME
 btrfs-snapman \- GTK4 manager for btrfs subvolume snapshots
 .SH SYNOPSIS
@@ -24,6 +24,11 @@ each governed by its own polkit action:
 listing needs no password for the active local session, snapshot changes ask
 for an administrator password (cached for a few minutes), and creating or
 removing a volume, or approving a new location, asks every time.
+.PP
+For terminals and SSH sessions, see
+.BR btrfs-snapman-cli (1),
+which uses the same helpers and configuration through
+.BR sudo (8).
 .SH FILES
 .TP
 .I /etc/btrfs-snapman/config.toml
@@ -40,9 +45,10 @@ One file per parent folder approved in the GUI, named after its path
 (e.g.\&
 .IR mnt-vmstorage-vmdisks.toml ).
 .TP
-.I /usr/share/doc/btrfs-snapman/examples/config.example.toml
+.I /usr/share/doc/btrfs-snapman-common/examples/config.example.toml
 Annotated example configuration.
 .SH SEE ALSO
+.BR btrfs-snapman-cli (1),
 .BR btrfs-subvolume (8),
 .BR pkexec (1),
 .BR journalctl (1)

@@ -1,0 +1,180 @@
+.TH BTRFS-SNAPMAN-CLI 1 "November 2026" "btrfs-snapman 0.7.0" "User Commands"
+.SH NAME
+btrfs-snapman-cli \- terminal manager for btrfs subvolume snapshots
+.SH SYNOPSIS
+.B btrfs-snapman-cli
+.br
+.B btrfs-snapman-cli
+.RB [ \-\-json ]
+.RB [ \-\-no\-color ]
+.I command
+.RI [ args ...]
+.SH DESCRIPTION
+.B btrfs-snapman-cli
+is the terminal front end of btrfs-snapman, for SSH sessions and headless
+machines.
+It does everything the GTK interface,
+.BR btrfs-snapman (1),
+does, through the same root helpers and configuration.
+.PP
+Without a command, on a terminal, it opens a full-screen interface: volumes on
+the left, the selected volume's snapshots on the right, and the command log
+below.
+Press
+.B ?
+for the keys.
+It needs at least 80\(mu24 characters.
+.PP
+With a command, it does one operation and exits, for scripts and cron.
+Results go to standard output; the equivalent shell commands (\fB$ ...\fR),
+notes, hook output and warnings go to standard error.
+.SH COMMANDS
+.TP
+.BR list " [\fIvolume\fR]"
+Without
+.IR volume :
+one line per volume with its path and snapshot count
+.RB ( ! ,
+followed by the error, if it can't be read).
+With
+.IR volume :
+its snapshots, newest first, with creation time, age, RO or RW, and the flags
+.BR received ,
+.B mounted
+and
+.BR "not from this source" .
+.TP
+.B locations
+The approved locations for new volumes: path, snapshot root, and the file that
+defines it.
+.TP
+.BR snapshot " \fIvolume\fR [\fIcomment\fR] [" \-\-ro | \-\-rw ]
+Take a snapshot and print its name.
+In the comment, spaces become underscores and only letters, digits,
+.B _
+and
+.B \-
+are kept.
+Read-only or not follows the volume's setting unless given.
+.TP
+.BR delete " \fIvolume snapshot\fR [" \-\-yes ]
+Delete a snapshot.
+On a terminal, type
+.B delete
+to confirm; otherwise
+.B \-\-yes
+is required.
+.TP
+.BR set\-ro " \fIvolume snapshot\fR " on | off " [" \-\-force ]
+Make a snapshot read-only or writable.
+Making a snapshot created by
+.B btrfs receive
+writable breaks incremental send chains: on a terminal you are asked to
+confirm; otherwise
+.B \-\-force
+is required.
+.TP
+.BR new\-volume " \fIname parent\fR [" \-\-folder " \fIf\fR] [" \-\-nocow | \-\-existing ]
+Create a subvolume
+.IR parent / f
+(default: the name) and its snapshot folder, and register it.
+.I parent
+must be an approved location.
+.B \-\-existing
+registers a subvolume that is already there.
+.TP
+.BR remove\-volume " \fIname\fR [" \-\-delete\-data " [" \-\-no\-final\-snapshot | \-\-delete\-snapshots "]] [" \-\-yes ]
+Unregister a volume created by btrfs-snapman.
+With
+.BR \-\-delete\-data ,
+also delete the subvolume, after taking a final read-only snapshot unless told
+otherwise.
+Prints what will happen, then asks you to type the volume name (or needs
+.BR \-\-yes ).
+.TP
+.BR add\-location " \fIpath\fR [" \-\-snapshot\-root " \fIdir\fR]"
+Approve a folder on btrfs for new volumes.
+Their snapshots go in
+.I dir
+(default:
+.I snapshots
+at the top of the same filesystem).
+.TP
+.BR remove\-location " \fIpath\fR [" \-\-yes ]
+Withdraw an approved location.
+Volumes already there stay registered.
+.SH OPTIONS
+.TP
+.B \-\-json
+Print each root helper's JSON object unchanged, instead of the usual output.
+.TP
+.B \-\-no\-color
+No colour.
+Also when the
+.B NO_COLOR
+environment variable is set, or when standard output is not a terminal.
+.TP
+.B \-\-version
+Print the version.
+.SH PRIVILEGES
+The program runs as the calling user and reaches the root helpers in
+.I /usr/libexec/btrfs-snapman
+with
+.BR "sudo \-n" ,
+or directly when already root.
+When sudo needs a password,
+.B sudo \-v
+asks for it on the terminal (outside the full-screen interface) and the call
+is retried once.
+Listing and snapshot changes use the sudo timestamp; creating or removing a
+volume, or approving or withdrawing a location, asks for the password every
+time.
+Without a terminal nothing can be asked, so unattended use needs root or a
+sudoers rule; see
+.IR /usr/share/doc/btrfs-snapman-cli/examples/sudoers.example .
+The password is never read, stored or passed on by the program.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The helper refused or failed; its error is printed.
+.TP
+.B 2
+Usage error.
+.TP
+.B 3
+sudo authentication failed or was cancelled.
+.TP
+.B 4
+Not confirmed, or confirmation needed without a terminal and no
+.B \-\-yes
+or
+.BR \-\-force .
+.TP
+.B 130
+Interrupted.
+.SH EXAMPLES
+Snapshot before an upgrade, from a script:
+.PP
+.RS
+.nf
+btrfs\-snapman\-cli snapshot Docker "before pihole v6"
+.fi
+.RE
+.SH FILES
+.TP
+.I /etc/btrfs-snapman/
+Configuration, shared with
+.BR btrfs-snapman (1).
+.TP
+.I /usr/share/doc/btrfs-snapman-cli/examples/sudoers.example
+Example sudo rules, e.g. listing without a password.
+.SH SEE ALSO
+.BR btrfs-snapman (1),
+.BR sudo (8),
+.BR visudo (8),
+.BR btrfs-subvolume (8)
+.PP
+Changes are logged to the journal: \fBjournalctl \-t btrfs-snapman\fR.

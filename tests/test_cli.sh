@@ -37,7 +37,7 @@ cli frobnicate;            assert "unknown command: exit 2"                     
 cli snapshot Docker --ro --rw; assert "--ro and --rw together: exit 2"          rc 2
 cli new-volume X "$MNT/vmdisks" --nocow --existing; assert "--nocow with --existing: exit 2" rc 2
 cli remove-volume X --delete-snapshots; assert "--delete-snapshots needs --delete-data: exit 2" rc 2
-cli --version;             assert "--version"                                   has "^btrfs-snapman-cli [0-9]" "$OUT"
+cli --version;             assert "--version matches debian/changelog"          [ "$OUT" = "btrfs-snapman-cli $(sed -n '1s/^btrfs-snapman (\([^)]*\)).*/\1/p' "$SRC/../debian/changelog")" ]
 assert "CLI never imports snapman_core or btrfsutil" \
   eval '! grep -qE "^\s*(import|from)\s+(snapman_core|btrfsutil)" "$SRC/btrfs-snapman-cli" "$SRC/snapman_client.py"'
 

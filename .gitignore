@@ -9,7 +9,7 @@ local/
 *.ddeb
 *.buildinfo
 *.changes
-debian/btrfs-snapman/
+debian/btrfs-snapman*/
 debian/.debhelper/
 debian/debhelper-build-stamp
 debian/files

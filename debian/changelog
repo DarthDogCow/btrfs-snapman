@@ -1,3 +1,17 @@
+btrfs-snapman (0.7.0) noble; urgency=medium
+
+  * New btrfs-snapman-cli: a curses interface and scriptable subcommands for
+    terminals and SSH, using the same root helpers through sudo (or directly
+    as root). Volume and location changes ask for the password every time.
+  * Split into three packages: btrfs-snapman-common (helpers, config,
+    shared modules), btrfs-snapman (GTK) and btrfs-snapman-cli, so headless
+    machines install no GTK or polkit.
+  * Code shared by both front ends moves to snapman_client.py.
+  * The journal names the caller via SUDO_UID as well as PKEXEC_UID.
+  * install.sh --cli installs the terminal interface only.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Tue, 17 Nov 2026 10:36:18 +0000
+
 btrfs-snapman (0.6.0) noble; urgency=medium
 
   * New volume: "Browse…" next to Parent picks a folder. A folder that isn't

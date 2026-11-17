@@ -1,4 +1,4 @@
-# Build the .deb on v* tags and attach it to the GitHub release.
+# Build the .debs on v* tags and attach them to the GitHub release.
 name: release
 on:
   push:
@@ -31,7 +31,7 @@ jobs:
       - name: Lintian
         run: lintian --fail-on error,warning *.changes
 
-      - name: Create release and attach the .deb
+      - name: Create release and attach the .debs
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" btrfs-snapman_*_all.deb --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" btrfs-snapman*_all.deb --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

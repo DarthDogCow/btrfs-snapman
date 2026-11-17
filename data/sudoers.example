@@ -1,0 +1,23 @@
+# Example sudo rules for btrfs-snapman-cli. Not installed by the package.
+#
+# btrfs-snapman-cli runs the root helpers with "sudo -n <helper> ...", so these rules
+# match the helpers' full paths. Install with
+#     sudo visudo -f /etc/sudoers.d/btrfs-snapman
+# and check the result with
+#     sudo visudo -c
+#
+# sudo uses the LAST rule that matches, and reads /etc/sudoers.d after /etc/sudoers, so the
+# NOPASSWD line below overrides Ubuntu's "%sudo ALL=(ALL:ALL) ALL". A file in sudoers.d
+# that sorts after this one and gives the same users ALL would override it again.
+#
+# Without any rule here, members of the sudo group can already use everything, with
+# their password (cached for 15 minutes for listing and snapshots; volume and location
+# changes always ask again, because btrfs-snapman-cli runs "sudo -k" before them).
+
+# List volumes and snapshots without a password (members of the sudo group):
+%sudo    ALL=(root) NOPASSWD: /usr/libexec/btrfs-snapman/snapman-query
+
+# Let members of a dedicated "snapman" group list, snapshot, delete snapshots and toggle
+# read-only (with their own password), but not create or remove volumes:
+#     sudo groupadd snapman && sudo usermod -aG snapman <user>
+%snapman ALL=(root) /usr/libexec/btrfs-snapman/snapman-query, /usr/libexec/btrfs-snapman/snapman-admin
