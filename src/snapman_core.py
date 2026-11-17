@@ -396,9 +396,14 @@ def _q(*args):
     return " ".join(shlex.quote(a) for a in args)
 
 
+def _caller_uid():
+    """Who asked for this: pkexec and sudo both say so in the environment."""
+    return os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID") or str(os.getuid())
+
+
 def _log(msg):
     """Write to the journal (journalctl -t btrfs-snapman), tagged with the calling user."""
-    uid = os.environ.get("PKEXEC_UID", str(os.getuid()))
+    uid = _caller_uid()
     syslog.openlog("btrfs-snapman", syslog.LOG_PID, syslog.LOG_AUTHPRIV)
     syslog.syslog(syslog.LOG_NOTICE, f"uid={uid} {msg}")
 
@@ -921,7 +926,7 @@ def dispatch(mode, argv, cfg):
 def main(mode, argv, config_path=CONFIG_PATH, enforce_ownership=True):
     """Called by the entry scripts. Prints one JSON object; exit code 0 = success."""
     if os.geteuid() != 0:
-        print(json.dumps({"ok": False, "error": "helper must run as root (via pkexec)"}))
+        print(json.dumps({"ok": False, "error": "helper must run as root (via pkexec or sudo)"}))
         return 1
     try:
         cfg = load_config(config_path, enforce_ownership)

@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -IB
 # Volume management entry point: new-volume / remove-volume / add-parent / remove-parent.
-# Polkit asks for the admin password every time (auth_admin, no caching).
+# Polkit asks for the admin password every time (auth_admin, no caching); btrfs-snapman-cli
+# runs sudo -k and sudo -v before each call to do the same.
 import sys
 sys.path.insert(0, "/usr/lib/btrfs-snapman")
 import snapman_core

@@ -313,5 +313,16 @@ chmod 666 "$CFGDIR/volumes.d/dataalias.toml"
 check "world-writable drop-in skipped"          ok   query list
 assert "  and reported"                         grep -q "dataalias.toml" <<<"$(field "d['result']['config_errors']")"
 
+# ---------------------------------------------------------------- privilege
+# The journal names the caller: pkexec's PKEXEC_UID, else sudo's SUDO_UID, else our own UID.
+caller() { env -u PKEXEC_UID -u SUDO_UID "$@" "$PY" -I -c "import sys; sys.path.insert(0, '$SRC'); import snapman_core as c; print(c._caller_uid())"; }
+assert "caller uid: PKEXEC_UID wins"            [ "$(caller PKEXEC_UID=1001 SUDO_UID=1002)" = 1001 ]
+assert "caller uid: then SUDO_UID"              [ "$(caller SUDO_UID=1002)" = 1002 ]
+assert "caller uid: empty PKEXEC_UID ignored"   [ "$(caller PKEXEC_UID= SUDO_UID=1002)" = 1002 ]
+assert "caller uid: else getuid()"              [ "$(caller)" = "$(id -u)" ]
+LAST=$("$PY" -I -c "import os, sys; sys.path.insert(0, '$SRC'); import snapman_core as c; os.seteuid(65534); sys.exit(c.main('query', ['list'], '$CFGDIR/config.toml'))")
+assert "non-root refused"                       [ $? -eq 1 ]
+assert "  error names pkexec and sudo"          grep -q "via pkexec or sudo" <<<"$LAST"
+
 echo; echo "passed=$pass failed=$fail"
 [ $fail -eq 0 ]

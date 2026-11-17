@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -IB
 # Snapshot entry point: snapshot / delete / set-ro.
-# Polkit asks for the admin password, then caches it for a few minutes.
+# Polkit asks for the admin password, then caches it for a few minutes; btrfs-snapman-cli
+# relies on the sudo timestamp in the same way.
 import sys
 sys.path.insert(0, "/usr/lib/btrfs-snapman")
 import snapman_core
