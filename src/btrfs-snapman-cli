@@ -1,0 +1,493 @@
+#!/usr/bin/python3
+"""
+btrfs-snapman-cli: the terminal front end of btrfs-snapman, for SSH and headless machines.
+
+  btrfs-snapman-cli                    full-screen TUI (on a terminal)
+  btrfs-snapman-cli COMMAND [ARGS]     one operation, for scripts and cron
+
+Runs as your normal user. Every operation goes through the same three root helpers as
+the GUI, but via sudo instead of pkexec (or directly when already root):
+
+  snapman-query   list                          uses the sudo timestamp
+  snapman-admin   snapshot | delete | set-ro    uses the sudo timestamp
+  snapman-manage  new-volume | remove-volume |  password every time (sudo -k, then sudo -v)
+                  add-parent | remove-parent
+
+It never imports snapman_core or btrfsutil and never writes to /etc/btrfs-snapman.
+Logic shared with the GUI lives in snapman_client.py.
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import subprocess
+import sys
+
+# Shared with the GUI. After the script's own folder, so a checkout runs its own copy.
+sys.path.insert(1, "/usr/lib/btrfs-snapman")
+from snapman_client import (LIBEXEC, fmt_age, fmt_time, helper_argv, log_lines,  # noqa: E402
+                            mount_of, parse_helper_output, remove_summary, sanitise_label,
+                            suggest_snapshot_root)
+
+VERSION = "0.7.0"
+
+# Exit codes
+EXIT_FAILED = 1         # the helper refused or failed
+EXIT_USAGE = 2
+EXIT_AUTH = 3           # sudo authentication failed or was cancelled
+EXIT_DECLINED = 4       # confirmation declined, or needed without a terminal
+EXIT_INTERRUPTED = 130
+
+
+class Abort(Exception):
+    """Stop with an exit code; the message (if any) goes to stderr as an error."""
+
+    def __init__(self, code, message=""):
+        super().__init__(message)
+        self.code = code
+
+
+# =========================================================================== sudo handling
+
+class Helpers:
+    """Runs the root helpers: sudo -n <helper> as an argv list, or the helper itself as root.
+
+    Never reads, stores or passes on a password: sudo -v asks for it on the terminal.
+    sudo -v only runs when sudo -n says it needs a password, so NOPASSWD rules (see
+    sudoers.example) work without a prompt, and cron jobs never wait for one.
+    """
+
+    def __init__(self, libexec=LIBEXEC):
+        self.libexec = libexec
+        self.via = None if os.geteuid() == 0 else "sudo"
+        self.interactive = sys.stdin.isatty()
+        # The TUI swaps in a context manager that leaves curses while sudo asks.
+        self.suspend = contextlib.nullcontext
+        self.last_stdout = ""
+
+    def authenticate(self, every_time=False):
+        """sudo -v on the real terminal (after sudo -k when every_time). True if it worked."""
+        if self.via is None:
+            return True
+        with self.suspend():
+            if every_time:
+                subprocess.run(["sudo", "-k"])
+            # Without a terminal there is nobody to ask, so only an existing timestamp
+            # or a NOPASSWD rule can work.
+            argv = ["sudo", "-v"] if self.interactive else ["sudo", "-n", "-v"]
+            return subprocess.run(argv).returncode == 0
+
+    def run(self, mode, args):
+        """One helper call -> (kind, response).
+
+        kind is as in parse_helper_output, except that an authentication that still
+        fails after one retry is "auth_failed".
+        """
+        exe = f"{self.libexec}/snapman-{mode}"
+        if not os.access(exe, os.X_OK):
+            return "failed", {"ok": False, "error": f"{exe} not found; is btrfs-snapman-common "
+                                                    "installed?"}
+        # snapman-manage asks every time, like polkit's auth_admin
+        if mode == "manage" and not self.authenticate(every_time=True):
+            return "auth_failed", self._auth_error(every_time=True)
+        kind, res = self._once(mode, args)
+        if kind == "auth_needed":
+            # No sudo timestamp yet, or it ran out: ask, then retry once
+            if not self.authenticate():
+                return "auth_failed", self._auth_error()
+            kind, res = self._once(mode, args)
+            if kind == "auth_needed":
+                kind = "auth_failed"
+        return kind, res
+
+    def _auth_error(self, every_time=False):
+        if self.interactive:
+            msg = "sudo authentication failed"
+        elif every_time:
+            msg = ("volume and location changes ask for the password every time, and there is "
+                   "no terminal to ask on; run them as root for unattended use")
+        else:
+            msg = ("sudo needs a password and there is no terminal to ask on; run as root, or "
+                   "allow it in sudoers (see sudoers.example)")
+        return {"ok": False, "error": msg}
+
+    def _once(self, mode, args):
+        argv = helper_argv(mode, args, self.via, self.libexec)
+        try:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        except OSError as e:
+            self.last_stdout = ""
+            return "failed", {"ok": False, "error": str(e)}
+        self.last_stdout = p.stdout.strip()
+        return parse_helper_output(p.returncode, p.stdout, p.stderr)
+
+
+# =========================================================================== CLI output
+
+class Output:
+    """Results to stdout; commands, notes, warnings and errors to stderr."""
+
+    CODES = {"error": "31", "warning": "33", "dim": "2"}
+
+    def __init__(self, json_mode, color):
+        self.json = json_mode
+        self.color = color
+
+    def _paint(self, text, style, stream):
+        if self.color and style and stream.isatty():
+            return f"\033[{self.CODES[style]}m{text}\033[0m"
+        return text
+
+    def result(self, text, style=None):
+        if not self.json:
+            print(self._paint(text, style, sys.stdout))
+
+    def info(self, text, style=None):
+        print(self._paint(text, style, sys.stderr), file=sys.stderr)
+
+    def error(self, text):
+        self.info("error: " + text, "error")
+
+    def response(self, res):
+        """The command-log lines for a helper response, or the raw JSON with --json."""
+        if self.json:
+            return
+        styles = {"command": "dim", "warning": "warning", "note": "dim", "hook": "dim"}
+        for kind, text in log_lines(res):
+            self.info(text, styles[kind])
+
+    def table(self, rows, header=None):
+        """Left-aligned columns; the header only on a terminal, so scripts get plain rows."""
+        with_header = bool(header and rows and sys.stdout.isatty())
+        if with_header:
+            rows = [header] + rows
+        if not rows:
+            return
+        widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+        for n, r in enumerate(rows):
+            line = "  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[-1]
+            self.result(line.rstrip(), "dim" if with_header and n == 0 else None)
+
+
+class Context:
+    def __init__(self, args):
+        self.helpers = Helpers(args.libexec)
+        color = not (args.no_color or os.environ.get("NO_COLOR")) and sys.stdout.isatty()
+        self.out = Output(args.json, color)
+
+    def call(self, mode, args, check=True, show=True):
+        """Run a helper and report it. Returns the response; with check, failures abort."""
+        kind, res = self.helpers.run(mode, args)
+        if self.out.json and show:
+            # The helper's own object, unchanged; ours only when there is none
+            print(self.helpers.last_stdout if kind in ("ok", "failed") else json.dumps(res))
+        if show:
+            self.out.response(res)
+        if kind == "auth_failed":
+            raise Abort(EXIT_AUTH, res["error"])
+        if check and not res["ok"]:
+            raise Abort(EXIT_FAILED, res.get("error", "unknown error"))
+        return res
+
+    def list(self):
+        """The helper's list result, without printing anything."""
+        return self.call("query", ["list"], show=False)["result"]
+
+
+def ask(prompt):
+    """Read one line from the terminal; the prompt goes to stderr, never into the results."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    line = sys.stdin.readline()
+    if not line:
+        sys.stderr.write("\n")
+    return line.rstrip("\n")
+
+
+def typed_delete(text):
+    """Case and surrounding spaces don't matter: "Delete", " delete " are fine (as in the GUI)."""
+    return text.strip().lower() == "delete"
+
+
+def confirm(ctx, prompt, accept, yes, what):
+    """Type-to-confirm on a terminal; without one, only --yes will do."""
+    if yes:
+        return
+    if not ctx.helpers.interactive:
+        raise Abort(EXIT_DECLINED, f"not confirmed: {what} needs --yes when there is no terminal")
+    if not accept(ask(prompt)):
+        raise Abort(EXIT_DECLINED, "not confirmed; nothing changed")
+
+
+def find_volume(data, name):
+    v = next((v for v in data["volumes"] if v["name"] == name), None)
+    if v is None:
+        raise Abort(EXIT_FAILED, f"unknown volume: {name}")
+    return v
+
+
+def config_warnings(ctx, data):
+    if ctx.out.json:
+        return
+    for e in data.get("config_errors", []):
+        ctx.out.info("warning: config: " + e, "warning")
+
+
+def strip_slash(path):
+    return path.rstrip("/") or "/"
+
+
+# =========================================================================== CLI subcommands
+
+def cmd_list(ctx, a):
+    res = ctx.call("query", ["list"])
+    data = res["result"]
+    config_warnings(ctx, data)
+    if ctx.out.json:
+        return
+    if a.volume is None:
+        rows = []
+        for v in data["volumes"]:
+            rows.append([v["name"], v["path"], "!" if v["error"] else str(len(v["snapshots"])),
+                         v["error"] or ""])
+        ctx.out.table(rows, ["VOLUME", "PATH", "SNAPS", ""])
+        return
+    v = find_volume(data, a.volume)
+    if v["error"]:
+        raise Abort(EXIT_FAILED, f"{v['name']}: {v['error']}")
+    rows = []
+    for s in v["snapshots"]:
+        flags = (["received"] if s["received"] else []) + \
+                (["mounted"] if s["mounted"] else []) + \
+                (["not from this source"] if not s["of_source"] else [])
+        rows.append([s["name"], fmt_time(s["otime"]), fmt_age(s["otime"]),
+                     "RO" if s["read_only"] else "RW", ", ".join(flags)])
+    if not rows:
+        ctx.out.info(f"{v['name']} has no snapshots yet", "dim")
+    ctx.out.table(rows, ["SNAPSHOT", "CREATED", "AGE", "", "FLAGS"])
+
+
+def cmd_locations(ctx, a):
+    data = ctx.call("query", ["list"])["result"]
+    config_warnings(ctx, data)
+    rows = [[p["path"], p["snapshot_root"], p["origin_file"]] for p in data["create_parents"]]
+    ctx.out.table(rows, ["LOCATION", "SNAPSHOT ROOT", "DEFINED IN"])
+
+
+def cmd_snapshot(ctx, a):
+    label = sanitise_label(a.comment or "")
+    args = ["snapshot", a.volume] + ([label] if label else []) + \
+        (["--ro"] if a.ro else ["--rw"] if a.rw else [])
+    res = ctx.call("admin", args)
+    ctx.out.result(res["result"]["name"])
+
+
+def cmd_delete(ctx, a):
+    confirm(ctx, f"Delete snapshot {a.snapshot}?\nType delete to confirm: ", typed_delete,
+            a.yes, "delete")
+    ctx.call("admin", ["delete", a.volume, a.snapshot])
+    ctx.out.result(f"Deleted {a.snapshot}")
+
+
+def cmd_set_ro(ctx, a):
+    value = "true" if a.state == "on" else "false"
+    args = ["set-ro", a.volume, a.snapshot, value] + (["--force"] if a.force else [])
+    res = ctx.call("admin", args, check=False)
+    err = res.get("error", "")
+    if not res["ok"] and err.startswith("RECEIVED_SNAPSHOT:"):
+        # Same warning as the GUI, then retry with --force if confirmed
+        if not ctx.helpers.interactive:
+            raise Abort(EXIT_DECLINED, f"{a.snapshot} was created by btrfs receive; making it "
+                                       "writable needs --force")
+        ctx.out.info(f"“{a.snapshot}” was created by btrfs receive. Making it writable breaks "
+                     "incremental send chains that use it as a parent.", "warning")
+        if ask("Make received snapshot writable? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise Abort(EXIT_DECLINED, "not confirmed; nothing changed")
+        res = ctx.call("admin", args + ["--force"])
+    elif not res["ok"]:
+        raise Abort(EXIT_FAILED, err or "unknown error")
+    ctx.out.result(f"{a.snapshot}: {'read-only' if value == 'true' else 'writable'}")
+
+
+def cmd_new_volume(ctx, a):
+    # The helper checks that PARENT is an approved location
+    args = ["new-volume", a.name, strip_slash(a.parent), a.folder or a.name]
+    args += (["--nocow"] if a.nocow else []) + (["--existing"] if a.existing else [])
+    res = ctx.call("manage", args)
+    ctx.out.result(f"Volume {res['result']['name']} ready")
+
+
+def cmd_remove_volume(ctx, a):
+    if (a.no_final_snapshot or a.delete_snapshots) and not a.delete_data:
+        raise Abort(EXIT_USAGE, "--no-final-snapshot and --delete-snapshots need --delete-data")
+    v = find_volume(ctx.list(), a.name)
+    if not v["removable"]:
+        raise Abort(EXIT_FAILED, f"{v['name']} is defined by hand in {v['origin_file']}; "
+                                 "remove it there")
+    if a.delete_data and not (v["data_deletable"] and not v["error"]):
+        raise Abort(EXIT_FAILED, "--delete-data is not available: only subvolumes created under "
+                                 "a configured parent can be deleted here")
+    final = a.delete_data and not a.delete_snapshots and not a.no_final_snapshot
+    ctx.out.info(remove_summary(v, a.delete_data, final, a.delete_snapshots))
+    confirm(ctx, f"Type {v['name']} to confirm: ", lambda t: t == v["name"], a.yes,
+            "remove-volume")
+
+    args = ["remove-volume", v["name"]]
+    if a.delete_data:
+        args.append("--delete-data")
+        if a.delete_snapshots:
+            args.append("--delete-snapshots")
+        elif not final:
+            args.append("--no-final-snapshot")
+    res = ctx.call("manage", args)["result"]
+    msg = f"Removed {v['name']}"
+    if res.get("final_snapshot"):
+        msg += f"; final snapshot kept at {res['final_snapshot']}"
+    ctx.out.result(msg)
+
+
+def cmd_add_location(ctx, a):
+    # Same rules as the GUI's Browse: a real folder on btrfs, snapshot root on the same mount
+    path = os.path.realpath(a.path)
+    if not os.path.isdir(path):
+        raise Abort(EXIT_FAILED, f"not a folder: {path}")
+    _mp, fstype = mount_of(path)
+    if fstype != "btrfs":
+        raise Abort(EXIT_FAILED, f"{path} is not on a btrfs filesystem ({fstype or 'unknown'})")
+    root = os.path.realpath(a.snapshot_root) if a.snapshot_root else suggest_snapshot_root(path)
+    ctx.out.info(f"Snapshots of {path}/X will go in {root}/X", "dim")
+    res = ctx.call("manage", ["add-parent", path, root])
+    ctx.out.result(f"Approved {res['result']['path']}")
+
+
+def cmd_remove_location(ctx, a):
+    path = strip_slash(a.path)
+    confirm(ctx, f"Remove the location {path}?\nType delete to confirm: ", typed_delete,
+            a.yes, "remove-location")
+    ctx.call("manage", ["remove-parent", path])
+    ctx.out.result(f"Removed location {path}")
+
+
+# =========================================================================== argument parsing
+
+def build_parser():
+    # --json and --no-color work before or after the subcommand. Each parser needs its own
+    # copy: parents share their option objects, defaults included.
+    def common():
+        c = argparse.ArgumentParser(add_help=False)
+        c.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                       help="print each helper's JSON object unchanged")
+        c.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS,
+                       help="no colour (also when NO_COLOR is set)")
+        return c
+
+    p = argparse.ArgumentParser(
+        prog="btrfs-snapman-cli", parents=[common()],
+        description="Manage btrfs snapshots from a terminal. Without a command, starts the "
+                    "full-screen interface.",
+        epilog="Exit codes: 0 ok, 1 refused or failed, 2 usage, 3 authentication, "
+               "4 not confirmed, 130 interrupted.")
+    p.set_defaults(json=False, no_color=False, func=None)
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    p.add_argument("--libexec", default=LIBEXEC, help=argparse.SUPPRESS)   # for tests
+    sub = p.add_subparsers(metavar="COMMAND", title="commands")
+
+    def cmd(name, func, help_):
+        s = sub.add_parser(name, parents=[common()], help=help_, description=help_)
+        s.set_defaults(func=func)
+        return s
+
+    s = cmd("list", cmd_list, "list volumes, or one volume's snapshots (newest first)")
+    s.add_argument("volume", nargs="?", metavar="VOLUME")
+
+    cmd("locations", cmd_locations, "list the approved locations for new volumes")
+
+    s = cmd("snapshot", cmd_snapshot, "snapshot a volume and print the new snapshot's name")
+    s.add_argument("volume", metavar="VOLUME")
+    s.add_argument("comment", nargs="?", metavar="COMMENT",
+                   help="spaces become _, only letters, digits, _ and - are kept")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--ro", action="store_true", help="read-only (default: the volume's setting)")
+    g.add_argument("--rw", action="store_true", help="writable")
+
+    s = cmd("delete", cmd_delete, "delete a snapshot")
+    s.add_argument("volume", metavar="VOLUME")
+    s.add_argument("snapshot", metavar="SNAPSHOT")
+    s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
+
+    s = cmd("set-ro", cmd_set_ro, "make a snapshot read-only (on) or writable (off)")
+    s.add_argument("volume", metavar="VOLUME")
+    s.add_argument("snapshot", metavar="SNAPSHOT")
+    s.add_argument("state", choices=["on", "off"])
+    s.add_argument("--force", action="store_true",
+                   help="allow making a received snapshot writable")
+
+    s = cmd("new-volume", cmd_new_volume,
+            "create a subvolume under an approved location and register it")
+    s.add_argument("name", metavar="NAME")
+    s.add_argument("parent", metavar="PARENT", help="an approved location (see 'locations')")
+    s.add_argument("--folder", metavar="F", help="folder name (default: NAME)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--nocow", action="store_true", help="NOCOW (chattr +C), for VM images")
+    g.add_argument("--existing", action="store_true",
+                   help="register a subvolume that's already there")
+
+    s = cmd("remove-volume", cmd_remove_volume,
+            "unregister a volume, optionally deleting its data")
+    s.add_argument("name", metavar="NAME")
+    s.add_argument("--delete-data", action="store_true",
+                   help="delete the subvolume (a final read-only snapshot is taken first)")
+    s.add_argument("--no-final-snapshot", action="store_true",
+                   help="with --delete-data: skip the final snapshot")
+    s.add_argument("--delete-snapshots", action="store_true",
+                   help="with --delete-data: also delete all its snapshots and the folder")
+    s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
+
+    s = cmd("add-location", cmd_add_location, "approve a folder as a location for new volumes")
+    s.add_argument("path", metavar="PATH")
+    s.add_argument("--snapshot-root", metavar="DIR",
+                   help="where their snapshots go (default: <mount point>/snapshots)")
+
+    s = cmd("remove-location", cmd_remove_location, "withdraw an approved location")
+    s.add_argument("path", metavar="PATH")
+    s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
+    return p
+
+
+# =========================================================================== entry point
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.func is None:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            parser.print_usage(sys.stderr)
+            return EXIT_USAGE
+        return run_tui(args)
+    ctx = Context(args)
+    try:
+        args.func(ctx, args)
+        return 0
+    except Abort as e:
+        if e.code == EXIT_USAGE:
+            parser.error(str(e))
+        if str(e):
+            ctx.out.error(str(e))
+        return e.code
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except BrokenPipeError:
+        # e.g. piped into head; don't print a traceback
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return EXIT_FAILED
+
+
+def run_tui(args):
+    print("btrfs-snapman-cli: the full-screen interface is not built yet", file=sys.stderr)
+    return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

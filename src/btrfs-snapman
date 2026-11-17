@@ -27,8 +27,8 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 # Shared with btrfs-snapman-cli. After the script's own folder, so a checkout runs its own copy.
 sys.path.insert(1, "/usr/lib/btrfs-snapman")
 from snapman_client import (LIBEXEC, NAME_RE, fmt_age, fmt_time, helper_argv,  # noqa: E402
-                            mount_of, new_volume_preview, parse_helper_output, preview_name,
-                            remove_summary, sanitise_label, suggest_snapshot_root)
+                            log_lines, mount_of, new_volume_preview, parse_helper_output,
+                            preview_name, remove_summary, sanitise_label, suggest_snapshot_root)
 
 APP_ID = "io.github.darthdogcow.BtrfsSnapman"
 
@@ -190,16 +190,10 @@ class Window(Adw.ApplicationWindow):
 
         def cb(res):
             self.set_busy(False)
-            result = (res.get("result") or {}) if res.get("ok") else {}
-            for c in res.get("commands", []):
-                self.log(c if c.startswith("#") else "$ " + c)   # "# ..." lines are notes
+            for _kind, text in log_lines(res):
+                self.log(text)
             for w in res.get("warnings", []):
-                self.log("warning: " + w)
                 self.toast(w, 8)
-            for n in result.get("notes", []):
-                self.log("note: " + n)
-            for h in result.get("hooks", []):
-                self.log(f"hook rc={h['rc']}: {' '.join(h['argv'])} {h['stderr'].strip()}".rstrip())
             if res.get("ok"):
                 if on_ok:
                     on_ok(res["result"])

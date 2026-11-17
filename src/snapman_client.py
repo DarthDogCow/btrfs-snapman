@@ -105,6 +105,21 @@ def helper_argv(mode, args, via, libexec=LIBEXEC):
     return prefix + [exe] + list(args)
 
 
+def log_lines(res):
+    """The command-log lines for one helper response, as (kind, text) pairs.
+
+    kind is "command", "warning", "note" or "hook". Errors are left to the caller.
+    """
+    result = (res.get("result") or {}) if res.get("ok") else {}
+    lines = [("command", c if c.startswith("#") else "$ " + c)    # "# ..." lines are notes
+             for c in res.get("commands", [])]
+    lines += [("warning", "warning: " + w) for w in res.get("warnings", [])]
+    lines += [("note", "note: " + n) for n in result.get("notes", [])]
+    lines += [("hook", f"hook rc={h['rc']}: {' '.join(h['argv'])} {h['stderr'].strip()}".rstrip())
+              for h in result.get("hooks", [])]
+    return lines
+
+
 def parse_helper_output(returncode, stdout, stderr):
     """Turn a finished helper call into (kind, response).
 
