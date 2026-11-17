@@ -40,8 +40,9 @@ configured  Users    /media/RAID/Users
 skipped              /media/SSD1/docker/archive/old  inside docker, whose snapshots don't include it
 ```
 - Snapshots, subvolumes nested inside a suggested one (their data isn't in its snapshots), and other tools' subvolumes (Docker's or Podman's storage, Timeshift, swap) aren't suggested.
-- The snapshot folder is where its snapshots with comments already are. Folders whose snapshots are named with only a timestamp (`snapshots/docker/2026-11-16_01-00-01`) are taken to belong to a cron job and avoided, so manual snapshots don't get mixed into something else's retention or replication. Without any, it's `snapshots/<name>` at the top of the filesystem.
+- The snapshot folder is where its hand-made snapshots already are (those with comments first). Folders a scheduled job fills are avoided, so manual snapshots don't get mixed into something else's retention or replication: they're recognised by timestamp-only names all made in the first seconds of a minute, as cron starts jobs on the minute (`snapshots/docker/2026-11-16_01-00-01`). Without any of its own, it's a folder where other snapshots with comments are, else `snapshots/<name>` at the top of the filesystem.
 - The name format is learned from the existing snapshots, so `docker_local_2026-11-16_13-44-37_Before_upgrade` gives `docker_local_{timestamp}_{label}`.
+- `--all` also suggests volumes for subvolumes that are already configured, so you can compare its choices with your setup before starting afresh.
 
 Then either register them straight away, after a y/N question (`--yes` without a terminal):
 ```

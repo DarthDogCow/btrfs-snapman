@@ -1,3 +1,13 @@
+btrfs-snapman (0.8.1) noble; urgency=medium
+
+  * discover: a folder of a volume's own snapshots taken without a comment
+    is its snapshot folder; it was taken for a scheduled job's. Scheduled
+    folders are now recognised by timestamp-only names made in the first
+    seconds of a minute. The name prefix of such snapshots is kept.
+  * discover --all also suggests for configured volumes, to compare.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Tue, 17 Nov 2026 11:51:31 +0000
+
 btrfs-snapman (0.8.0) noble; urgency=medium
 
   * btrfs-snapman-cli discover: finds every mounted btrfs filesystem and its

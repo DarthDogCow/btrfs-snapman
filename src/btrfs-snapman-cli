@@ -36,7 +36,7 @@ from snapman_client import (LIBEXEC, NAME_RE, fmt_age, fmt_time, helper_argv,  #
                             render_toml, sanitise_label, suggest_snapshot_root,
                             suggest_volumes)
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 # Exit codes
 EXIT_FAILED = 1         # the helper refused or failed
@@ -398,8 +398,11 @@ def register(ctx, items, yes):
 def cmd_discover(ctx, a):
     if a.names and not a.install:
         raise Abort(EXIT_USAGE, "volume names only go with --install")
+    if a.all and a.install:
+        raise Abort(EXIT_USAGE, "--all is for looking only; it can't go with --install")
     found = ctx.call("query", ["discover"], show=not (a.toml or a.install))["result"]
-    suggestions = suggest_volumes(found, ctx.list()["volumes"])
+    # --all: as if nothing were configured, to compare with the current setup
+    suggestions = suggest_volumes(found, [] if a.all else ctx.list()["volumes"])
     new = [s for s in suggestions if s["status"] == "new"]
     if a.toml:
         sys.stdout.write(render_toml(suggestions))
@@ -533,6 +536,9 @@ def build_parser():
     g.add_argument("--install", action="store_true",
                    help="register the suggested volumes (all new ones, or just NAMEs)")
     s.add_argument("names", nargs="*", metavar="NAME", help="with --install: only these")
+    s.add_argument("--all", action="store_true",
+                   help="also suggest for subvolumes that are already volumes (to compare "
+                        "before starting afresh)")
     s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
 
     s = cmd("register", cmd_register,

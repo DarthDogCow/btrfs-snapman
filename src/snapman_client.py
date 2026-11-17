@@ -213,12 +213,20 @@ def _skip_reason(sub, ro_folders, uuids):
 
 
 def _formats(name, names):
-    """(name_format, timestamp_format) that reproduce the labelled names, or None."""
-    seen = collections.Counter()
+    """(name_format, timestamp_format) that reproduce the names, or None.
+
+    Labelled names decide; without any, timestamped names with a prefix (snapshots taken
+    without a comment, e.g. 'Virtual_OS_Museum_2026-07-23_11-30-45') do.
+    """
+    labelled, prefixed = collections.Counter(), collections.Counter()
     for nm in names:
         parts = split_snapshot_name(nm)
-        if parts and parts[2] and re.fullmatch(r"[A-Za-z0-9._-]*", parts[0]):
-            seen[parts[:2]] += 1
+        if parts and re.fullmatch(r"[A-Za-z0-9._-]*", parts[0]):
+            if parts[2]:
+                labelled[parts[:2]] += 1
+            elif parts[0]:
+                prefixed[parts[:2]] += 1
+    seen = labelled or prefixed
     if not seen:
         return None
     prefix, tsf = seen.most_common(1)[0][0]
@@ -229,6 +237,18 @@ def _formats(name, names):
 
 def _labelled(names):
     return sum(1 for nm in names if (p := split_snapshot_name(nm)) and p[2])
+
+
+def _scheduled(names):
+    """True for snapshots a scheduled job made: timestamp-only names, all from the first
+    seconds of a minute (cron starts jobs on the minute; people rarely do). A single one
+    counts only as a bare timestamp, with no name in front, as scripts tend to write."""
+    stamps = [TIMESTAMP_RE.search(nm) for nm in names]
+    if not names or not all(stamps) or _labelled(names):
+        return False
+    if len(names) == 1 and stamps[0].start() > 0:
+        return False
+    return all(m.group(9) is None or int(m.group(9)) < 10 for m in stamps)
 
 
 def suggest_volumes(discovered, volumes):
@@ -302,13 +322,16 @@ def suggest_volumes(discovered, volumes):
             name = _volume_name(c["path"], path, taken)
             own = by_parent.get(c["uuid"], {})
             alternatives = sorted(((f, len(n)) for f, n in own.items()), key=lambda x: -x[1])
-            # Where its labelled (by hand) snapshots are; else where anything's labelled ones
-            # are; else a new folder. Folders of timestamp-only names belong to scheduled jobs.
-            manual = {f: _labelled(n) for f, n in own.items() if _labelled(n)}
+            # Where its own hand-made snapshots are (most with comments, then most in all);
+            # else where anything's labelled ones are; else a new folder. Folders filled by a
+            # scheduled job are left to it.
+            manual = {f: n for f, n in own.items() if not _scheduled(n)}
             shared = {f: _labelled(n) for f, n in any_folder.items() if _labelled(n)}
             if manual:
-                folder = max(manual, key=manual.get)
-                why = f"holds {manual[folder]} of its snapshots with comments"
+                folder = max(manual, key=lambda f: (_labelled(manual[f]), len(manual[f])))
+                k = _labelled(manual[folder])
+                why = (f"holds {k} of its snapshots with comments" if k else
+                       f"holds {len(manual[folder])} of its snapshots")
             elif shared:
                 folder = max(shared, key=shared.get)
                 why = "holds other snapshots with comments on this filesystem"

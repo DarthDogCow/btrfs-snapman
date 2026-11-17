@@ -254,6 +254,38 @@ class Discover(unittest.TestCase):
         got = by_path(c.suggest_volumes({"filesystems": [fs]}, []))
         self.assertEqual([p for p, s in got.items() if s["status"] == "new"], ["/m/data"])
 
+    def test_vm_folders_without_comments(self):
+        # Snapshots taken in the GUI without a comment, one folder per VM: those folders
+        # are the volumes' own, not a scheduled job's, and their name prefix is kept
+        fs = fake_fs([
+            ("vmdisks/ApxWin", False, None),
+            ("vmdisks/museum", False, None),
+            ("vmdisks/Empty", False, None),
+            ("snapshots/ApxWin/ApxWin_2026-07-23_11-28-47", True, "vmdisks/ApxWin"),
+            ("snapshots/ApxWin/ApxWin-Fresh-Build", True, "vmdisks/ApxWin"),
+            ("snapshots/museum/Museum_OS_2026-07-23_11-30-45", True, "vmdisks/museum"),
+            ("snapshots/museum/museum_22-Jul-2206", True, "vmdisks/museum"),
+        ], [("/mnt/vm", "/")])
+        got = by_path(c.suggest_volumes({"filesystems": [fs]}, []))
+        apx = got["/mnt/vm/vmdisks/ApxWin"]
+        self.assertEqual((apx["snapshot_dir"], apx["why"]),
+                         ("/mnt/vm/snapshots/ApxWin", "holds 2 of its snapshots"))
+        self.assertEqual(apx["name_format"], "{volume}_{timestamp}_{label}")
+        museum = got["/mnt/vm/vmdisks/museum"]
+        self.assertEqual(museum["snapshot_dir"], "/mnt/vm/snapshots/museum")
+        self.assertEqual(museum["name_format"], "Museum_OS_{timestamp}_{label}")
+        self.assertEqual(got["/mnt/vm/vmdisks/Empty"]["snapshot_dir"], "/mnt/vm/snapshots/Empty")
+
+    def test_scheduled(self):
+        self.assertTrue(c._scheduled(["2026-11-12_01-00-01", "2026-11-13_01-00-01"]))
+        self.assertTrue(c._scheduled(["2026-11-17_11-10-03", "2026-11-17_11-15-02"]))
+        self.assertTrue(c._scheduled(["certs_2025-11-15_01-00-01", "certs_2025-11-22_01-00-01"]))
+        self.assertTrue(c._scheduled(["2026-11-12_01-00-01"]))                  # bare timestamp
+        self.assertFalse(c._scheduled(["A_2026-11-12_01-00-01"]))
+        self.assertFalse(c._scheduled(["A_2026-07-23_11-28-47", "A_2026-07-24_09-01-02"]))
+        self.assertFalse(c._scheduled(["2026-11-12_01-00-01", "2026-11-13_01-00-01_pre"]))
+        self.assertFalse(c._scheduled(["2026-11-12_01-00-01", "Fresh-Build"]))
+
     def test_toml_round_trip(self):
         sugg = c.suggest_volumes({"filesystems": [SERVER]}, [{"name": "x", "path": "/nope"}])
         text = c.render_toml(sugg)

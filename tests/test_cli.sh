@@ -176,6 +176,10 @@ assert "--toml: valid TOML with the suggestions"        eval 'rc 0 && "$PY" -c "
 assert "  configured ones as comments"                  has "^# $MNT/@docker: already configured as Docker$" "$OUT"
 cli discover media
 assert "names without --install: exit 2"                rc 2
+cli discover --all
+assert "--all: configured ones suggested too"           has "^new +docker +$MNT/@docker" "$OUT"
+cli discover --all --install --yes
+assert "--all with --install: exit 2"                   rc 2
 cli discover --install media
 assert "--install without a terminal: exit 4"           eval 'rc 4 && [ ! -e "$CFGDIR/volumes.d/media.toml" ]'
 assert "  plan shown first"                             has "media +$MNT/@media -> $MNT/snapshots/adhoc" "$ERR"

@@ -1,4 +1,4 @@
-.TH BTRFS-SNAPMAN-CLI 1 "November 2026" "btrfs-snapman 0.8.0" "User Commands"
+.TH BTRFS-SNAPMAN-CLI 1 "November 2026" "btrfs-snapman 0.8.1" "User Commands"
 .SH NAME
 btrfs-snapman-cli \- terminal manager for btrfs subvolume snapshots
 .SH SYNOPSIS
@@ -104,7 +104,7 @@ at the top of the same filesystem).
 Withdraw an approved location.
 Volumes already there stay registered.
 .TP
-.BR discover " [" \-\-toml " | " \-\-install " [\fIname\fR ...]] [" \-\-yes ]
+.BR discover " [" \-\-all "] [" \-\-toml " | " \-\-install " [\fIname\fR ...]] [" \-\-yes ]
 Find the subvolumes on every mounted btrfs filesystem and suggest volumes for
 the ones not yet configured.
 Snapshots, subvolumes nested inside a suggested one, and subvolumes of other
@@ -120,6 +120,10 @@ tables to review and edit;
 .B \-\-install
 registers them (all new ones, or the named ones) after asking, or with
 .BR \-\-yes .
+.B \-\-all
+also makes suggestions for subvolumes that are already volumes, to compare
+with the current setup (not with
+.BR \-\-install ).
 .TP
 .BR register " \fIfile\fR [" \-\-yes ]
 Register existing subvolumes from a TOML file of
