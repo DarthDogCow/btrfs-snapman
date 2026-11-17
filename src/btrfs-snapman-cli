@@ -19,16 +19,19 @@ Logic shared with the GUI lives in snapman_client.py.
 
 import argparse
 import contextlib
+import curses
+import datetime as dt
 import json
+import locale
 import os
 import subprocess
 import sys
 
 # Shared with the GUI. After the script's own folder, so a checkout runs its own copy.
 sys.path.insert(1, "/usr/lib/btrfs-snapman")
-from snapman_client import (LIBEXEC, fmt_age, fmt_time, helper_argv, log_lines,  # noqa: E402
-                            mount_of, parse_helper_output, remove_summary, sanitise_label,
-                            suggest_snapshot_root)
+from snapman_client import (LIBEXEC, NAME_RE, fmt_age, fmt_time, helper_argv,  # noqa: E402
+                            log_lines, mount_of, new_volume_preview, parse_helper_output,
+                            preview_name, remove_summary, sanitise_label, suggest_snapshot_root)
 
 VERSION = "0.7.0"
 
@@ -70,13 +73,15 @@ class Helpers:
         """sudo -v on the real terminal (after sudo -k when every_time). True if it worked."""
         if self.via is None:
             return True
-        with self.suspend():
+        ok = False      # stays False if the TUI's suspend swallows a Ctrl-C at the prompt
+        with self.suspend(every_time):
             if every_time:
                 subprocess.run(["sudo", "-k"])
             # Without a terminal there is nobody to ask, so only an existing timestamp
             # or a NOPASSWD rule can work.
             argv = ["sudo", "-v"] if self.interactive else ["sudo", "-n", "-v"]
-            return subprocess.run(argv).returncode == 0
+            ok = subprocess.run(argv).returncode == 0
+        return ok
 
     def run(self, mode, args):
         """One helper call -> (kind, response).
@@ -455,6 +460,1080 @@ def build_parser():
     return p
 
 
+# =========================================================================== TUI: terminal basics
+
+MIN_H, MIN_W = 24, 80
+LEFT_W = 24                     # width of the volumes pane, borders included
+
+BOX_UNICODE = {"tl": "┌", "tr": "┐", "bl": "└", "br": "┘", "h": "─", "v": "│"}
+BOX_ASCII = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|"}
+# What the ASCII fallback draws instead of the few non-ASCII characters we use
+ASCII_TEXT = str.maketrans({"·": "-", "…": "...", "→": "->", "←": "<-", "↑": "Up", "↓": "Down",
+                            "—": "-", "×": "x", "“": '"', "”": '"', "’": "'", "\n": " ",
+                            "\t": " "})
+
+HELP = [
+    ("↑ ↓ / j k, PgUp PgDn, Home End", "Move in the focused pane"),
+    ("Tab, ← →", "Switch pane"),
+    ("Enter", "Snapshot details (every field, for copying)"),
+    ("s", "Snapshot the selected volume"),
+    ("d, Delete", "Delete the selected snapshot"),
+    ("r", "Toggle read-only on the selected snapshot"),
+    ("n", "New volume"),
+    ("x", "Remove the selected volume (if created here)"),
+    ("a", "Approve a new location for volumes"),
+    ("L", "Locations: list them, remove approved ones"),
+    ("l", "Expand / collapse the command log"),
+    ("F5, Ctrl-R", "Refresh"),
+    ("?", "This help"),
+    ("q", "Quit (Esc closes a dialog)"),
+]
+FLAG_HELP = "Snapshot flags: recv = created by btrfs receive, mnt = mounted, " \
+            "other = not a snapshot of this volume's source."
+
+K_ENTER = ("\n", "\r", curses.KEY_ENTER)
+K_ESC = "\x1b"
+K_BACKSPACE = (curses.KEY_BACKSPACE, "\x7f", "\b")
+K_UP = (curses.KEY_UP, "k")
+K_DOWN = (curses.KEY_DOWN, "j")
+K_HOME = (curses.KEY_HOME, "\x01")
+K_END = (curses.KEY_END, "\x05")
+
+
+def unicode_ok():
+    """True if the terminal takes UTF-8.
+
+    A C or POSIX locale makes Python switch to UTF-8 behind our back (PEP 538/540), so
+    UTF-8 mode that nobody asked for means the user's locale wasn't UTF-8.
+    """
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    if sys.flags.utf8_mode and not os.environ.get("PYTHONUTF8"):
+        return False
+    return locale.nl_langinfo(locale.CODESET).upper().replace("-", "") == "UTF8"
+
+
+def wrap(text, width):
+    """Split text into lines of at most width characters, at spaces where possible."""
+    lines = []
+    for para in text.split("\n"):
+        line = ""
+        for word in para.split(" "):
+            while len(word) > width:                 # long paths: hard break
+                if line:
+                    lines.append(line)
+                    line = ""
+                lines.append(word[:width])
+                word = word[width:]
+            if line and len(line) + 1 + len(word) > width:
+                lines.append(line)
+                line = word
+            else:
+                line = f"{line} {word}" if line else word
+        lines.append(line)
+    return lines
+
+
+def complete_dir(text):
+    """Complete a directory path like a shell does: (new text, matching names)."""
+    path = os.path.expanduser(text) if text else "/"
+    head, tail = os.path.split(path)
+    head = head or "."
+    try:
+        names = sorted(n for n in os.listdir(head)
+                       if n.startswith(tail) and (tail.startswith(".") or not n.startswith("."))
+                       and os.path.isdir(os.path.join(head, n)))
+    except OSError:
+        return text, []
+    if not names:
+        return text, []
+    new = os.path.join(head, os.path.commonprefix(names))
+    return (new + "/" if len(names) == 1 else new), names
+
+
+# =========================================================================== TUI: form component
+
+class Field:
+    """One input in a Form: "text", "toggle" or "choice"."""
+
+    def __init__(self, label, kind, value="", choices=(), enabled=True, note="", complete=None):
+        self.label, self.kind, self.value = label, kind, value
+        self.choices = list(choices)            # for "choice": value is an index into these
+        self.enabled = enabled
+        self.note = note                        # shown after the field, e.g. why it's disabled
+        self.complete = complete                # text -> (new text, matches), for Tab
+        self.matches = []
+        self.pos = len(value) if kind == "text" else 0
+        self.touched = False                    # edited by the user
+
+    def set(self, value):
+        self.value = value
+        if self.kind == "text":
+            self.pos = len(value)
+
+    def display(self):
+        if self.kind == "toggle":
+            return "[x]" if self.value else "[ ]"
+        if self.kind == "choice":
+            return f"< {self.choices[self.value]} >" if self.choices else "(none)"
+        return self.value
+
+
+class Form:
+    """A modal dialog: text fields, toggles and choices over live info lines.
+
+    update(form) runs after every change; it may change fields and sets form.info
+    (a list of (text, style)), form.valid and form.submit. Enter submits only when
+    valid; Esc cancels. run() returns {name: value} or None.
+    """
+
+    def __init__(self, tui, title, body, fields, update, submit="OK"):
+        self.tui, self.title, self.body = tui, title, body
+        self.fields = fields                    # {name: Field}, in display order
+        self.update_fn = update
+        self.submit, self.valid, self.info = submit, True, []
+        self.focus = next((n for n, f in fields.items() if f.enabled), None)
+        self.update()
+
+    def update(self):
+        self.update_fn(self)
+        if self.focus and not self.fields[self.focus].enabled:
+            self.move(1)
+
+    def move(self, step):
+        names = [n for n, f in self.fields.items() if f.enabled]
+        if not names:
+            self.focus = None
+            return
+        i = names.index(self.focus) if self.focus in names else -1
+        self.focus = names[(i + step) % len(names)]
+
+    def run(self):
+        while True:
+            self.tui.draw()
+            if self.tui.too_small():
+                key = self.tui.getkey()
+                if key == K_ESC:
+                    return None
+                continue
+            self.draw()
+            key = self.tui.getkey()
+            if key is None or key == curses.KEY_RESIZE:
+                continue
+            if key == K_ESC:
+                return None
+            if key in K_ENTER:
+                if self.valid:
+                    return {n: f.value for n, f in self.fields.items()}
+                continue
+            f = self.fields.get(self.focus)
+            if key == "\t" and f and f.kind == "text" and f.complete:
+                f.value, f.matches = f.complete(f.value)
+                f.pos, f.touched = len(f.value), True
+            elif key in ("\t", curses.KEY_DOWN):
+                self.move(1)
+            elif key in (curses.KEY_BTAB, curses.KEY_UP):
+                self.move(-1)
+            elif f and self.edit(f, key):
+                f.touched = True
+                f.matches = []
+            else:
+                continue
+            self.update()
+
+    def edit(self, f, key):
+        """Apply one key to the focused field. True if it changed the value."""
+        if f.kind == "toggle":
+            if key == " ":
+                f.value = not f.value
+                return True
+        elif f.kind == "choice":
+            if f.choices and key in (curses.KEY_LEFT, curses.KEY_RIGHT, " "):
+                f.value = (f.value + (-1 if key == curses.KEY_LEFT else 1)) % len(f.choices)
+                return True
+        elif key == curses.KEY_LEFT:
+            f.pos = max(0, f.pos - 1)
+        elif key == curses.KEY_RIGHT:
+            f.pos = min(len(f.value), f.pos + 1)
+        elif key in K_HOME:
+            f.pos = 0
+        elif key in K_END:
+            f.pos = len(f.value)
+        elif key in K_BACKSPACE:
+            if f.pos:
+                f.value, f.pos = f.value[:f.pos - 1] + f.value[f.pos:], f.pos - 1
+                return True
+        elif key == curses.KEY_DC:
+            if f.pos < len(f.value):
+                f.value = f.value[:f.pos] + f.value[f.pos + 1:]
+                return True
+        elif key == "\x15":                     # Ctrl-U: delete back to the start
+            f.value, f.pos = f.value[f.pos:], 0
+            return True
+        elif isinstance(key, str) and key.isprintable():
+            f.value, f.pos = f.value[:f.pos] + key + f.value[f.pos:], f.pos + 1
+            return True
+        return False
+
+    def draw(self):
+        t = self.tui
+        H, W = t.scr.getmaxyx()
+        w = min(W - 4, 78)
+        inner = w - 4
+        label_w = max([len(f.label) for f in self.fields.values()] + [0]) + 2
+        rows = []                               # (text, style, field name or None)
+        for line in self.body:
+            rows += [(x, None, None) for x in wrap(line, inner)]
+        if self.body and self.fields:
+            rows.append(("", None, None))
+        for name, f in self.fields.items():
+            rows.append((name, "field", name))
+        if self.info:
+            rows.append(("", None, None))
+        for text, style in self.info:
+            rows += [(x, style, None) for x in wrap(text, inner)]
+        rows.append(("", None, None))
+        keys = f"Enter {self.submit}   Esc Cancel"
+        rows.append((keys.rjust(inner), None if self.valid else "dim", None))
+        rows = rows[:H - 4]
+        h = len(rows) + 2
+        y0, x0 = (H - h) // 2, (W - w) // 2
+        t.box(y0, x0, h, w, self.title, fill=True)
+        cursor = None
+        for i, (text, style, name) in enumerate(rows):
+            y = y0 + 1 + i
+            if name is None:
+                t.put(y, x0 + 2, text, t.style(style), inner)
+                continue
+            f = self.fields[name]
+            focused = name == self.focus
+            t.put(y, x0 + 2, f.label, t.style(None if f.enabled else "dim"), label_w)
+            fx, fw = x0 + 2 + label_w, inner - label_w
+            if f.kind == "text":
+                box_w = fw - 2
+                start = max(0, f.pos - box_w + 1)
+                shown = f.value[start:start + box_w].ljust(box_w)
+                t.put(y, fx, "[" + shown + "]", t.style("sel" if focused else None), fw)
+                if focused:
+                    cursor = (y, fx + 1 + f.pos - start)
+            else:
+                text = f.display()
+                t.put(y, fx, text, t.style("sel" if focused else None if f.enabled else "dim"))
+                if f.note:
+                    t.put(y, fx + len(t.txt(text)) + 2, f.note, t.style("dim"),
+                          fw - len(t.txt(text)) - 2)
+        t.cursor(cursor)
+        t.scr.refresh()
+
+
+# =========================================================================== TUI: main screen
+
+class Tui:
+    def __init__(self, scr, helpers, args, first, unicode):
+        self.scr = scr
+        self.helpers = helpers
+        helpers.suspend = self.suspended
+        self.unicode = unicode
+        self.g = BOX_UNICODE if self.unicode else BOX_ASCII
+        self.host = os.uname().nodename
+        self.data = None                # last result of "list"
+        self.vol = None                 # selected volume's name
+        self.snap = None                # selected snapshot's name
+        self.focus = 0                  # 0 volumes pane, 1 snapshots pane
+        self.vol_top = self.snap_top = 0
+        self.log = []                   # (text, style)
+        self.status = None              # (text, style), until the next key
+        self.busy = False
+        self.config_errors = []
+        self._init_colours(args)
+        self.cursor(None)
+        self.scr.keypad(True)
+        self.report(first)
+        if first["ok"]:
+            self.apply(first["result"])
+
+    # ------------------------------------------------------------------ drawing primitives
+
+    def _init_colours(self, args):
+        self.colour = curses.has_colors() and not (args.no_color or os.environ.get("NO_COLOR"))
+        self.attrs = {None: 0, "dim": curses.A_DIM, "sel": curses.A_REVERSE,
+                      "bold": curses.A_BOLD, "error": curses.A_BOLD, "warning": curses.A_BOLD}
+        # curses.wrapper has already called start_color(); keep the terminal's own
+        # foreground and background either way, rather than white on black
+        bg = curses.COLOR_BLACK
+        if curses.has_colors():
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                pass
+        if self.colour:
+            curses.init_pair(1, curses.COLOR_RED, bg)
+            curses.init_pair(2, curses.COLOR_YELLOW, bg)
+            self.attrs["error"] = curses.color_pair(1) | curses.A_BOLD
+            self.attrs["warning"] = curses.color_pair(2)
+
+    def style(self, name):
+        return self.attrs[name]
+
+    def cursor(self, pos):
+        """Show the cursor at pos (y, x), or hide it."""
+        try:
+            curses.curs_set(1 if pos else 0)
+            if pos:
+                self.scr.move(*pos)
+        except curses.error:
+            pass
+
+    def txt(self, text):
+        """Text as the terminal can show it: ASCII stand-ins without UTF-8."""
+        text = str(text)
+        if self.unicode:
+            return text.replace("\n", " ").replace("\t", " ")
+        return text.translate(ASCII_TEXT).encode("ascii", "replace").decode()
+
+    def put(self, y, x, text, attr=0, width=None):
+        """addstr that clips to width and the screen, and never raises at the edges."""
+        H, W = self.scr.getmaxyx()
+        if not 0 <= y < H or x >= W:
+            return
+        text = self.txt(text)
+        width = W - x if width is None else min(width, W - x)
+        if width <= 0:
+            return
+        try:
+            self.scr.addstr(y, x, text[:width], attr)
+        except curses.error:
+            pass                                # writing the bottom-right cell "fails"
+
+    def box(self, y, x, h, w, title="", attr=0, fill=False):
+        g = self.g
+        if fill:
+            for i in range(1, h - 1):
+                self.put(y + i, x, " " * w)
+        self.put(y, x, g["tl"] + g["h"] * (w - 2) + g["tr"], attr)
+        for i in range(1, h - 1):
+            self.put(y + i, x, g["v"], attr)
+            self.put(y + i, x + w - 1, g["v"], attr)
+        self.put(y + h - 1, x, g["bl"] + g["h"] * (w - 2) + g["br"], attr)
+        if title:
+            self.put(y, x + 1, f" {title} ", attr | curses.A_BOLD, w - 2)
+
+    def too_small(self):
+        H, W = self.scr.getmaxyx()
+        return H < MIN_H or W < MIN_W
+
+    def getkey(self):
+        try:
+            return self.scr.get_wch()
+        except curses.error:
+            return None
+
+    # ------------------------------------------------------------------ helper calls
+
+    @contextlib.contextmanager
+    def suspended(self, every_time=False):
+        """Leave curses while sudo asks for the password on the real terminal."""
+        curses.def_prog_mode()
+        curses.endwin()
+        print("\nbtrfs-snapman: " + ("volume and location changes ask for your password "
+                                     "every time." if every_time else
+                                     "sudo needs your password.") + " (Ctrl-C cancels)")
+        try:
+            yield
+        except KeyboardInterrupt:
+            pass                        # cancelled at the prompt: authenticate() returns False
+        finally:
+            curses.reset_prog_mode()
+            self.scr.clear()
+
+    def add_log(self, text, style=None):
+        self.log.append((f"[{dt.datetime.now():%H:%M:%S}] {text}", style))
+
+    def report(self, res, quiet=False):
+        """Log a helper response like the GUI; warnings and errors also go to the status line."""
+        styles = {"command": None, "warning": "warning", "note": "dim", "hook": "dim"}
+        for kind, text in log_lines(res):
+            self.add_log(text, styles[kind])
+        for w in res.get("warnings", []):
+            self.status = ("warning: " + w, "warning")
+        if not res.get("ok"):
+            self.add_log("error: " + res.get("error", "unknown"), "error")
+            if not quiet:
+                self.status = ("error: " + res.get("error", "unknown error"), "error")
+
+    def call(self, mode, args, quiet=False):
+        """Run a helper with "Working…" showing, and drop keys typed meanwhile."""
+        self.busy = True
+        self.draw()
+        self.scr.refresh()
+        try:
+            _kind, res = self.helpers.run(mode, args)
+        finally:
+            self.busy = False
+            curses.flushinp()
+        self.report(res, quiet)
+        return res
+
+    def refresh(self):
+        res = self.call("query", ["list"])
+        if res["ok"]:
+            self.apply(res["result"])
+
+    def apply(self, data):
+        """Take a new list result, keeping the selection by name."""
+        self.data = data
+        errs = data.get("config_errors", [])
+        if errs != self.config_errors:          # log broken drop-ins once, not on every refresh
+            for e in errs:
+                self.add_log("config: " + e, "warning")
+        self.config_errors = errs
+        names = [v["name"] for v in data["volumes"]]
+        if self.vol not in names:
+            self.vol = names[0] if names else None
+        self._fix_snap()
+
+    def _fix_snap(self):
+        v = self.volume()
+        snaps = [s["name"] for s in v["snapshots"]] if v else []
+        if self.snap not in snaps:
+            self.snap = snaps[0] if snaps else None
+
+    def volume(self):
+        if not self.data:
+            return None
+        return next((v for v in self.data["volumes"] if v["name"] == self.vol), None)
+
+    def snapshot(self):
+        v = self.volume()
+        return next((s for s in v["snapshots"] if s["name"] == self.snap), None) if v else None
+
+    # ------------------------------------------------------------------ main screen
+
+    def draw(self):
+        self.scr.erase()
+        H, W = self.scr.getmaxyx()
+        if self.too_small():
+            msg = self.txt("Terminal too small (need 80×24)")
+            self.put(H // 2, max(0, (W - len(msg)) // 2), msg)
+            self.cursor(None)
+            return
+        left = f" btrfs-snapman · {self.host}"
+        if self.helpers.via is None:
+            left += " · running as root"
+        right = ("Working…   " if self.busy else "") + "? help  q quit "
+        self.put(0, 0, left, self.style("bold"))
+        self.put(0, W - len(self.txt(right)), right, self.style("dim"))
+
+        if self.status:
+            self.put(1, 1, self.status[0], self.style(self.status[1]), W - 2)
+        elif self.config_errors:
+            self.put(1, 1, f"{len(self.config_errors)} config file(s) could not be loaded — "
+                           "press l for details", self.style("warning"), W - 2)
+
+        ph = H - 4
+        self.draw_volumes(2, 0, ph, LEFT_W)
+        self.draw_details(2, LEFT_W, ph, W - LEFT_W)
+
+        last = self.log[-1] if self.log else ("", None)
+        self.put(H - 2, 0, f" Log {self.g['h']} ", self.style("dim"))
+        self.put(H - 2, 7, last[0][11:], self.style(last[1] or "dim"), W - 8)
+        self.put(H - 1, 0, " s snapshot  d delete  r read-only  n new vol  x remove vol  "
+                           "a location  l log", self.style("dim"))
+        self.cursor(None)
+
+    def draw_volumes(self, y, x, h, w):
+        focused = self.focus == 0
+        self.box(y, x, h, w, "Volumes", 0 if focused else self.style("dim"))
+        vols = self.data["volumes"] if self.data else []
+        if not vols:
+            self.put(y + 1, x + 2, "(none)" if self.data else "(not loaded)", self.style("dim"))
+            return
+        rows = h - 2
+        idx = next((i for i, v in enumerate(vols) if v["name"] == self.vol), 0)
+        self.vol_top = min(max(self.vol_top, idx - rows + 1), idx)
+        for i, v in enumerate(vols[self.vol_top:self.vol_top + rows]):
+            sel = v["name"] == self.vol
+            count = "!" if v["error"] else str(len(v["snapshots"]))
+            name_w = w - 4 - len(count) - 1
+            name = v["name"] if len(v["name"]) <= name_w else v["name"][:name_w - 1] + "…"
+            line = f"{'>' if sel else ' '} {name.ljust(name_w)} {count}"
+            attr = self.style("sel") if sel and focused else self.style("bold") if sel else 0
+            if v["error"] and not (sel and focused):
+                attr |= self.style("error")
+            self.put(y + 1 + i, x + 1, line, attr, w - 2)
+
+    def draw_details(self, y, x, h, w):
+        v = self.volume()
+        focused = self.focus == 1
+        border = 0 if focused else self.style("dim")
+        iw, ix = w - 4, x + 2
+        if v is None:
+            self.box(y, x, h, w, "", border)
+            if self.data:
+                self.put(y + 2, ix, "No volumes configured", self.style("bold"))
+                for i, line in enumerate(wrap("Press n for a new volume, or add [[volume]] "
+                                              "entries to /etc/btrfs-snapman/config.toml", iw)):
+                    self.put(y + 4 + i, ix, line)
+            return
+        self.box(y, x, h, w, f"{v['name']} · {v['path']}", border)
+
+        lines = []                      # (label, value, style)
+        if v["error"]:
+            lines.append(("", "Volume unavailable", "error"))
+            lines += [("", line, None) for line in wrap(v["error"], iw)]
+            lines.append(("", "", None))
+        else:
+            s = v["source"]
+            lines.append(("Snapshots", v["snapshot_dir"], None))
+            lines.append(("Subvolume", f"ID {s['id']} · {s['uuid']}", None))
+            flags = (["NOCOW (chattr +C)"] if s.get("nocow") else []) + \
+                    (["read-only"] if s["read_only"] else [])
+            if flags:
+                lines.append(("Attributes", " · ".join(flags), None))
+            hooks = v["hooks"]
+            if hooks["pre_snapshot"] or hooks["post_snapshot"]:
+                desc = "; ".join(" ".join(c) for c in hooks["pre_snapshot"]) or "—"
+                desc += " → " + ("; ".join(" ".join(c) for c in hooks["post_snapshot"]) or "—")
+                lines.append(("Hooks", desc, None))
+        how = "(managed)" if v["origin"] == "dropin" else "(by hand)"
+        lines.append(("Registered", f"{v['origin_file']} {how}", None))
+        row = y + 1
+        for label, value, style in lines:
+            if label:
+                self.put(row, ix, label, self.style("dim"), 11)
+                value = value if len(value) <= iw - 11 else value[:iw - 12] + "…"
+                self.put(row, ix + 11, value, self.style(style), iw - 11)
+            else:
+                self.put(row, ix, value, self.style(style), iw)
+            row += 1
+        if v["error"]:
+            return
+
+        snaps = v["snapshots"]
+        row += 1
+        self.put(row, ix, f"Snapshots ({len(snaps)})", self.style("bold"))
+        self.put(row, ix + iw - 12, "newest first", self.style("dim"))
+        row += 1
+        if not snaps:
+            self.put(row, ix, "No snapshots yet. Press s to take one.", self.style("dim"))
+            return
+        rows = y + h - 1 - row
+        idx = next((i for i, s in enumerate(snaps) if s["name"] == self.snap), 0)
+        self.snap_top = min(max(self.snap_top, idx - rows + 1), idx)
+
+        def flags(s):
+            return " ".join((["recv"] if s["received"] else []) +
+                            (["mnt"] if s["mounted"] else []) +
+                            (["other"] if not s["of_source"] else []))
+        flag_w = max(len(flags(s)) for s in snaps)
+        name_w = iw - 2 - 9 - 4 - (flag_w + 1 if flag_w else 0)
+        for i, s in enumerate(snaps[self.snap_top:self.snap_top + rows]):
+            sel = s["name"] == self.snap
+            name = s["name"] if len(s["name"]) <= name_w else s["name"][:name_w - 1] + "…"
+            line = (f"{'>' if sel else ' '} {name.ljust(name_w)} {fmt_age(s['otime']):>8}  "
+                    f"{'RO' if s['read_only'] else 'RW'}" + (f" {flags(s)}" if flag_w else ""))
+            attr = self.style("sel") if sel and focused else self.style("bold") if sel else 0
+            self.put(row + i, ix - 1, line, attr, iw + 1)
+
+    # ------------------------------------------------------------------ main loop
+
+    def run(self):
+        while True:
+            self.draw()
+            key = self.getkey()
+            if key is None or key == curses.KEY_RESIZE:
+                continue
+            if self.too_small():
+                if key == "q":
+                    return 0
+                continue
+            self.status = None
+            if key == "q":
+                return 0
+            self.handle(key)
+
+    def handle(self, key):
+        if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+            self.focus = 1 - self.focus if key in ("\t", curses.KEY_BTAB) else \
+                (0 if key == curses.KEY_LEFT else 1)
+        elif key in K_UP + K_DOWN + K_HOME + K_END + (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.move(key)
+        elif key in K_ENTER:
+            if self.focus == 0:
+                self.focus = 1
+            elif self.snapshot():
+                self.details(self.volume(), self.snapshot())
+        elif key in (curses.KEY_F5, "\x12"):
+            self.refresh()
+        elif key == "?":
+            self.pager("Help", [(f"{k:<32}{d}", None) for k, d in HELP] +
+                       [("", None)] + [(x, "dim") for x in wrap(FLAG_HELP, 70)], ("?",))
+        elif key == "l":
+            self.pager("Command log", self.log or [("(empty)", "dim")], ("l",), at_end=True)
+        elif key == "L":
+            self.locations()
+        elif not self.data:
+            self.status = ("Nothing loaded yet; press F5 to retry", "warning")
+        elif key == "s":
+            self.dialog_snapshot()
+        elif key in ("d", curses.KEY_DC):
+            self.dialog_delete()
+        elif key == "r":
+            self.toggle_ro()
+        elif key == "n":
+            self.dialog_new_volume()
+        elif key == "x":
+            self.dialog_remove_volume()
+        elif key == "a":
+            self.dialog_approve()
+
+    def move(self, key):
+        """Up/down/page/home/end in the focused pane."""
+        H, _ = self.scr.getmaxyx()
+        v = self.volume()
+        if self.focus == 0:
+            names = [x["name"] for x in self.data["volumes"]] if self.data else []
+            cur = self.vol
+        else:
+            names = [s["name"] for s in v["snapshots"]] if v and not v["error"] else []
+            cur = self.snap
+        if not names:
+            return
+        i = names.index(cur) if cur in names else 0
+        page = max(1, H - 14)
+        i = {**{k: i - 1 for k in K_UP}, **{k: i + 1 for k in K_DOWN},
+             **{k: 0 for k in K_HOME}, **{k: len(names) - 1 for k in K_END},
+             curses.KEY_PPAGE: i - page, curses.KEY_NPAGE: i + page}[key]
+        i = max(0, min(len(names) - 1, i))
+        if self.focus == 0:
+            if names[i] != self.vol:
+                self.vol, self.snap, self.snap_top = names[i], None, 0
+                self._fix_snap()
+        else:
+            self.snap = names[i]
+
+    # ------------------------------------------------------------------ full-screen views
+
+    def pager(self, title, lines, close_keys=(), at_end=False):
+        """Scrollable full-screen text (help, log, details). Esc or q closes."""
+        top = None
+        while True:
+            self.scr.erase()
+            H, W = self.scr.getmaxyx()
+            if self.too_small():
+                self.draw()
+            else:
+                wrapped = []
+                for text, style in lines:
+                    wrapped += [(x, style) for x in wrap(self.txt(text), W - 4)]
+                rows = H - 3
+                maxtop = max(0, len(wrapped) - rows)
+                top = maxtop if top is None and at_end else min(max(top or 0, 0), maxtop)
+                self.box(0, 0, H - 1, W, title)
+                for i, (text, style) in enumerate(wrapped[top:top + rows]):
+                    self.put(1 + i, 2, text, self.style(style), W - 4)
+                more = f" {top + 1}-{min(top + rows, len(wrapped))} of {len(wrapped)} " \
+                    if len(wrapped) > rows else ""
+                self.put(H - 1, 1, "↑ ↓ PgUp PgDn Home End scroll   Esc close" + more,
+                         self.style("dim"))
+                self.cursor(None)
+            key = self.getkey()
+            if key in (K_ESC, "q") + tuple(close_keys) + K_ENTER:
+                return
+            page = max(1, H - 4)
+            top = top or 0
+            if key in K_UP:
+                top -= 1
+            elif key in K_DOWN:
+                top += 1
+            elif key == curses.KEY_PPAGE:
+                top -= page
+            elif key == curses.KEY_NPAGE:
+                top += page
+            elif key in K_HOME:
+                top = 0
+            elif key in K_END:
+                top = 1 << 30
+
+    def details(self, v, s):
+        """Every field from list for one snapshot, unabridged, so it can be copied."""
+        labels = {"name": "Name", "path": "Path", "otime": "Created", "read_only": "Read-only",
+                  "id": "ID", "parent_id": "Parent ID", "uuid": "UUID",
+                  "parent_uuid": "Parent UUID", "received_uuid": "Received UUID",
+                  "generation": "Generation", "received": "Received", "mounted": "Mounted",
+                  "of_source": "Of this source", "manageable": "Manageable"}
+        lines = [("Volume", v["name"])]
+        for key in list(labels) + sorted(k for k in s if k not in labels):
+            if key not in s:
+                continue
+            val = s[key]
+            if key == "otime":
+                val = f"{fmt_time(val)} ({fmt_age(val)})"
+            elif isinstance(val, bool):
+                val = "yes" if val else "no"
+            lines.append((labels.get(key, key), str(val)))
+        self.pager(f"Snapshot {s['name']}", [(f"{k:<16}{val}", None) for k, val in lines])
+
+    def locations(self):
+        """The create parents; parents.d ones can be removed here."""
+        idx = 0
+        while True:
+            parents = self.data["create_parents"] if self.data else []
+            idx = max(0, min(idx, len(parents) - 1))
+            self.scr.erase()
+            H, W = self.scr.getmaxyx()
+            if self.too_small():
+                self.draw()
+            else:
+                self.box(0, 0, H - 1, W, "Locations for new volumes")
+                if self.status:
+                    self.put(1, 2, self.status[0], self.style(self.status[1]), W - 4)
+                if not parents:
+                    self.put(3, 2, "None approved yet. Press a to approve one.",
+                             self.style("dim"))
+                row = 3
+                for i, p in enumerate(parents):
+                    if row + 3 > H - 2:
+                        break
+                    sel = i == idx
+                    self.put(row, 1, f"{'>' if sel else ' '} {p['path']}",
+                             self.style("sel") if sel else self.style("bold"), W - 2)
+                    self.put(row + 1, 4, f"snapshots in {p['snapshot_root']}", 0, W - 6)
+                    how = "approved here" if p["origin"] == "dropin" else "by hand"
+                    self.put(row + 2, 4, f"{p['origin_file']} ({how})", self.style("dim"),
+                             W - 6)
+                    row += 4
+                self.put(H - 1, 1, "↑ ↓ move   d remove   a approve   F5 refresh   Esc back",
+                         self.style("dim"))
+                self.cursor(None)
+            key = self.getkey()
+            if key is None or key == curses.KEY_RESIZE:
+                continue
+            self.status = None
+            if key in (K_ESC, "q", "L"):
+                return
+            if key in K_UP:
+                idx -= 1
+            elif key in K_DOWN:
+                idx += 1
+            elif key in (curses.KEY_F5, "\x12"):
+                self.refresh()
+            elif key == "a":
+                self.dialog_approve()
+            elif key in ("d", curses.KEY_DC) and parents:
+                self.dialog_remove_location(parents[idx])
+
+    # ------------------------------------------------------------------ snapshot actions
+
+    def dialog_snapshot(self):
+        """Comment, live name preview, read-only toggle, plus hook/NOCOW notes."""
+        v = self.volume()
+        if not v:
+            return
+        if v["error"]:
+            self.status = (f"error: volume unavailable: {v['error']}", "error")
+            return
+        fields = {"comment": Field("Comment", "text"),
+                  "ro": Field("Read-only", "toggle", v["default_read_only"])}
+
+        def update(f):
+            f.info = [(f"Name: {preview_name(v, sanitise_label(fields['comment'].value))}",
+                       "bold")]
+            if v["hooks"]["pre_snapshot"]:
+                f.info.append(("Hooks will run: " + "; ".join(
+                    " ".join(h) for h in v["hooks"]["pre_snapshot"]), None))
+            if v["source"].get("nocow"):
+                f.info.append(("Source is NOCOW: running VMs give a crash-consistent snapshot "
+                               "only, unless hooks freeze them", "dim"))
+        res = Form(self, f"Snapshot “{v['name']}”",
+                   [f"{v['path']} → {v['snapshot_dir']}/"], fields, update, "Snapshot").run()
+        if res is None:
+            return
+        label = sanitise_label(res["comment"])
+        args = ["snapshot", v["name"]] + ([label] if label else []) + \
+            (["--ro"] if res["ro"] else ["--rw"])
+        r = self.call("admin", args)
+        if r["ok"]:
+            self.done(f"Created {r['result']['name']}")
+        self.refresh_keep_status()
+
+    def done(self, msg):
+        """Report success on the status line (and the log, in full), keeping a warning."""
+        self.add_log(msg)
+        if self.status and self.status[1] == "warning":
+            self.status = (f"{msg} · {self.status[0]}", "warning")
+        else:
+            self.status = (msg, None)
+
+    def refresh_keep_status(self):
+        """Refresh after a change without losing the message about the change."""
+        status = self.status
+        self.refresh()
+        if self.status is None or (status and status[1] in ("error", "warning")):
+            self.status = status
+
+    def dialog_delete(self):
+        """Delete one snapshot; Enter only works once the word 'delete' is typed."""
+        v, s = self.volume(), self.snapshot()
+        if not s:
+            self.status = ("No snapshot selected", "warning")
+            return
+        if not s["manageable"]:
+            self.status = ("This snapshot's name can't be managed here", "warning")
+            return
+        if s["mounted"]:
+            self.status = ("Mounted snapshots can't be deleted", "warning")
+            return
+        fields = {"confirm": Field("Confirm", "text")}
+
+        def update(f):
+            f.valid = typed_delete(fields["confirm"].value)
+        res = Form(self, "Delete snapshot?", [s["name"], "", "Type delete to confirm."],
+                   fields, update, "Delete").run()
+        if res is None:
+            return
+        r = self.call("admin", ["delete", v["name"], s["name"]])
+        if r["ok"]:
+            self.done(f"Deleted {s['name']}")
+            self.refresh_keep_status()
+
+    def toggle_ro(self, force=False):
+        """Flip read-only. Received snapshots get a y/N warning before going writable."""
+        v, s = self.volume(), self.snapshot()
+        if not s:
+            self.status = ("No snapshot selected", "warning")
+            return
+        if not s["manageable"]:
+            self.status = ("This snapshot's name can't be managed here", "warning")
+            return
+        target = "false" if s["read_only"] else "true"
+        args = ["set-ro", v["name"], s["name"], target] + (["--force"] if force else [])
+        received = False
+        r = self.call("admin", args, quiet=True)
+        if not r["ok"]:
+            if r.get("error", "").startswith("RECEIVED_SNAPSHOT:") and not force:
+                received = True
+            else:
+                self.status = ("error: " + r.get("error", "unknown error"), "error")
+        if received:
+            if self.ask("Make received snapshot writable?",
+                        f"“{s['name']}” was created by btrfs receive. Making it writable breaks "
+                        "incremental send chains that use it as a parent.", "Make writable"):
+                self.toggle_ro(force=True)
+            return
+        self.refresh_keep_status()
+
+    def ask(self, title, text, yes_label):
+        """A y/N question in a box. True only for y."""
+        while True:
+            self.draw()
+            if not self.too_small():
+                H, W = self.scr.getmaxyx()
+                w = min(W - 4, 70)
+                lines = wrap(text, w - 4) + ["", f"y {yes_label}   n/Esc Cancel".rjust(w - 4)]
+                y0, x0 = (H - len(lines) - 2) // 2, (W - w) // 2
+                self.box(y0, x0, len(lines) + 2, w, title, self.style("warning"), fill=True)
+                for i, line in enumerate(lines):
+                    self.put(y0 + 1 + i, x0 + 2, line, 0, w - 4)
+            key = self.getkey()
+            if key in ("y", "Y"):
+                return True
+            if key in ("n", "N", K_ESC) + K_ENTER:
+                return False
+
+    # ------------------------------------------------------------------ volume management
+
+    def dialog_new_volume(self):
+        """Create (or register an existing) subvolume under an approved location."""
+        parents = self.data["create_parents"]
+        if not parents:
+            self.status = ("No approved locations yet: press a to approve one", "warning")
+            return
+        fields = {"parent": Field("Parent", "choice", 0, [p["path"] for p in parents]),
+                  "name": Field("Name", "text"),
+                  "folder": Field("Folder", "text", note=""),
+                  "existing": Field("Use existing", "toggle", False,
+                                    note="register a subvolume that's already there"),
+                  "nocow": Field("NOCOW", "toggle", False,
+                                 note="for VM images: no checksums or compression")}
+
+        def update(f):
+            p = parents[fields["parent"].value]
+            name = fields["name"].value
+            fol = fields["folder"].value or name
+            existing = fields["existing"].value
+            fields["nocow"].enabled = not existing
+            if existing:
+                fields["nocow"].value = False
+            fields["nocow"].note = "not with Use existing" if existing else \
+                "for VM images: no checksums or compression"
+            f.valid = bool(NAME_RE.match(name)) and bool(NAME_RE.match(fol))
+            f.submit = "Register" if existing else "Create"
+            lines = new_volume_preview(p, fol, existing)
+            f.info = [("Will create:", "bold")] + [(x, None) for x in lines or ["—"]]
+            if name and not NAME_RE.match(name):
+                f.info.append(("Name: letters, digits, '.', '_' and '-' (max 64)", "warning"))
+            elif fields["folder"].value and not NAME_RE.match(fol):
+                f.info.append(("Folder: letters, digits, '.', '_' and '-' (max 64)", "warning"))
+            f.info.append(("Folder defaults to Name. Asks for your password every time.", "dim"))
+        res = Form(self, "New volume", ["Creates a subvolume and its snapshot folder, and "
+                                        "registers it."], fields, update, "Create").run()
+        if res is None:
+            return
+        p = parents[res["parent"]]
+        args = ["new-volume", res["name"], p["path"], res["folder"] or res["name"]]
+        args += (["--nocow"] if res["nocow"] else []) + (["--existing"] if res["existing"] else [])
+        r = self.call("manage", args)
+        if r["ok"]:
+            self.done(f"Volume {r['result']['name']} ready")
+            self.vol, self.snap = r["result"]["name"], None      # select it after the refresh
+            self.refresh_keep_status()
+
+    def dialog_remove_volume(self):
+        """Unregister a volume created here, optionally deleting its data and snapshots."""
+        v = self.volume()
+        if not v:
+            return
+        if not v["removable"]:
+            self.status = (f"{v['name']} is defined by hand in {v['origin_file']}; "
+                           "remove it there", "warning")
+            return
+        nsnaps = len(v["snapshots"])
+        can_delete = v["data_deletable"] and not v["error"]
+        fields = {
+            "delete": Field("Delete data", "toggle", False, enabled=can_delete,
+                            note=v["path"] if can_delete else
+                            "not available: only subvolumes created under a configured "
+                            "parent can be deleted here"),
+            "final": Field("Final snapshot", "toggle", True,
+                           note="take a read-only snapshot first"),
+            "snaps": Field("Delete snapshots", "toggle", False,
+                           note=f"also delete its {nsnaps} snapshot(s) and the folder"),
+            "confirm": Field("Confirm", "text"),
+        }
+
+        # Which options make sense together, as in the GUI
+        def update(f):
+            deleting = fields["delete"].value
+            fields["final"].enabled = deleting and not fields["snaps"].value
+            fields["snaps"].enabled = deleting
+            if not deleting:
+                fields["snaps"].value = False
+            if fields["snaps"].value:
+                fields["final"].value = False
+            f.info = [(remove_summary(v, deleting, fields["final"].value,
+                                      fields["snaps"].value), "bold"),
+                      (f"Type {v['name']} to confirm.", None)]
+            f.submit = "Delete" if deleting else "Unregister"
+            f.valid = fields["confirm"].value == v["name"]
+        res = Form(self, f"Remove volume “{v['name']}”?", [], fields, update,
+                   "Unregister").run()
+        if res is None:
+            return
+        args = ["remove-volume", v["name"]]
+        if res["delete"]:
+            args.append("--delete-data")
+            if res["snaps"]:
+                args.append("--delete-snapshots")
+            elif not res["final"]:
+                args.append("--no-final-snapshot")
+        r = self.call("manage", args)
+        if r["ok"]:
+            msg = f"Removed {v['name']}"
+            if r["result"].get("final_snapshot"):
+                msg += f"; final snapshot kept at {r['result']['final_snapshot']}"
+            self.done(msg)
+            self.vol = None
+            self.refresh_keep_status()
+
+    def dialog_approve(self):
+        """Approve a folder as a new location (add-parent), snapshot root on the same fs."""
+        fields = {"path": Field("Folder", "text", "/", complete=complete_dir),
+                  "root": Field("Snapshot root", "text", complete=complete_dir)}
+
+        def update(f):
+            path = os.path.expanduser(fields["path"].value)
+            real = os.path.realpath(path) if path else ""
+            ok_dir = os.path.isabs(path) and os.path.isdir(path)
+            mp, fstype = mount_of(real) if ok_dir else ("", "")
+            root = fields["root"]
+            if not root.touched:            # follows the folder until edited by hand
+                root.set(suggest_snapshot_root(real) if ok_dir else "")
+            f.info = []
+            for fl in fields.values():
+                if len(fl.matches) > 1:
+                    shown = "  ".join(fl.matches[:12]) + ("  …" if len(fl.matches) > 12 else "")
+                    f.info.append((f"Matches: {shown}", "dim"))
+            if not ok_dir:
+                f.info.append(("Not an existing folder (absolute path). Tab completes.",
+                               "warning"))
+            elif fstype != "btrfs":
+                f.info.append((f"{real} is not on a btrfs filesystem ({fstype or 'unknown'})",
+                               "error"))
+            else:
+                f.info.append((f"Filesystem mounted at {mp}", None))
+                f.info.append(("Snapshots of <folder>/X go in <snapshot root>/X, on the same "
+                               "btrfs filesystem; it is created if missing.", "dim"))
+            f.info.append(("New volumes may then be created in this folder. Asks for your "
+                           "password every time.", "dim"))
+            f.valid = ok_dir and fstype == "btrfs" and os.path.isabs(root.value)
+        res = Form(self, "Approve new location", [], fields, update, "Approve").run()
+        if res is None:
+            return
+        path = os.path.realpath(os.path.expanduser(res["path"]))
+        root = os.path.realpath(os.path.expanduser(res["root"]))
+        r = self.call("manage", ["add-parent", path, root])
+        if r["ok"]:
+            self.done(f"Approved {r['result']['path']}")
+            self.refresh_keep_status()
+
+    def dialog_remove_location(self, p):
+        if p["origin"] != "dropin":
+            self.status = (f"{p['path']} is defined by hand in {p['origin_file']}; "
+                           "remove it there", "warning")
+            return
+        fields = {"confirm": Field("Confirm", "text")}
+
+        def update(f):
+            f.valid = typed_delete(fields["confirm"].value)
+        res = Form(self, "Remove location?",
+                   [p["path"], "", "New volumes can no longer be created there. Volumes "
+                    "already there stay registered, but their data can no longer be deleted "
+                    "from here.", "", "Type delete to confirm."], fields, update,
+                   "Remove").run()
+        if res is None:
+            return
+        r = self.call("manage", ["remove-parent", p["path"]])
+        if r["ok"]:
+            self.done(f"Removed location {p['path']}")
+            self.refresh_keep_status()
+
+
+def run_tui(args):
+    """Load the list (asking for the sudo password first if needed), then start curses."""
+    helpers = Helpers(args.libexec)
+    try:
+        kind, first = helpers.run("query", ["list"])
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return EXIT_INTERRUPTED
+    if kind == "auth_failed":
+        print(f"btrfs-snapman-cli: {first['error']}", file=sys.stderr)
+        return EXIT_AUTH
+    os.environ.setdefault("ESCDELAY", "25")
+    unicode = unicode_ok()                  # sets the locale, which must happen before curses
+    try:
+        return curses.wrapper(lambda scr: Tui(scr, helpers, args, first, unicode).run())
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    except curses.error as e:
+        print(f"btrfs-snapman-cli: cannot start the full-screen interface: {e}", file=sys.stderr)
+        return EXIT_FAILED
+
+
 # =========================================================================== entry point
 
 def main(argv):
@@ -482,11 +1561,6 @@ def main(argv):
         # e.g. piped into head; don't print a traceback
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return EXIT_FAILED
-
-
-def run_tui(args):
-    print("btrfs-snapman-cli: the full-screen interface is not built yet", file=sys.stderr)
-    return EXIT_USAGE
 
 
 if __name__ == "__main__":
