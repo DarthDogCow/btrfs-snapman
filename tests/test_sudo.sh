@@ -1,12 +1,12 @@
 #!/bin/bash
 # sudo flow test for btrfs-snapman-cli as an ordinary user. Creates users, writes
 # /etc/sudoers.d and /etc/btrfs-snapman/config.toml, so run it as root ONLY on a
-# disposable Ubuntu 24.04 machine or container, with the 0.7.0 btrfs-snapman-common and
+# disposable Ubuntu 24.04 machine or container, with the btrfs-snapman-common and
 # btrfs-snapman-cli packages installed (the sudo rules name the installed helpers).
 # Password prompts are answered through tmux. Usage: sudo tests/test_sudo.sh
 set -u
 command -v tmux >/dev/null || { echo "tmux is not installed"; exit 2; }
-[ -x /usr/libexec/btrfs-snapman/snapman-query ] || { echo "install the 0.7.0 packages first"; exit 2; }
+[ -x /usr/libexec/btrfs-snapman/snapman-query ] || { echo "install the packages first"; exit 2; }
 WORK=$(mktemp -d); chmod 755 "$WORK"
 MNT=$WORK/mnt
 ETC=/etc/btrfs-snapman

@@ -1,3 +1,17 @@
+btrfs-snapman (0.8.0) noble; urgency=medium
+
+  * btrfs-snapman-cli discover: finds every mounted btrfs filesystem and its
+    subvolumes, and suggests volumes, with a snapshot folder and name format
+    learned from the snapshots already there. --toml prints them as config
+    to review; --install registers them.
+  * btrfs-snapman-cli register FILE registers existing subvolumes from a
+    TOML file of [[volume]] tables, e.g. edited discover --toml output.
+  * New helper verbs: snapman-query discover (read-only) and
+    snapman-manage register, which writes one volumes.d file per volume and
+    checks every path; a batch is registered completely or not at all.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Tue, 17 Nov 2026 11:35:17 +0000
+
 btrfs-snapman (0.7.0) noble; urgency=medium
 
   * New btrfs-snapman-cli: a curses interface and scriptable subcommands for

@@ -3,7 +3,7 @@
 # btrfs-snapman-cli must not pull in GTK, GObject introspection, pkexec or polkit.
 # Only simulates, but run it on a clean machine (a disposable VM or container) so the
 # answer reflects a fresh Pi rather than whatever is already installed.
-# Usage: tests/test_headless.sh NEW_DIR      (the folder with the 0.7.0 .debs)
+# Usage: tests/test_headless.sh NEW_DIR      (the folder with the new .debs)
 set -u
 NEW=$(realpath "$1")
 OUT=$(apt-get install --simulate "$NEW"/btrfs-snapman-common_*_all.deb \

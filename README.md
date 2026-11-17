@@ -27,22 +27,48 @@ A small tool for managing btrfs subvolumes and snapshots by hand, with two front
   btrfs-snapman-cli new-volume Pihole /srv/containers
   btrfs-snapman-cli remove-volume Pihole --delete-data
   btrfs-snapman-cli locations | add-location PATH | remove-location PATH
+  btrfs-snapman-cli discover                      # suggest volumes for the subvolumes found
   ```
   Results go to stdout; the equivalent commands, notes, hook output and warnings to stderr. `--json` prints the helper's JSON instead. Destructive commands ask you to type a confirmation on a terminal, and need `--yes` (or `--force` for making a received snapshot writable) without one. Exit codes: 0 ok, 1 refused or failed, 2 usage, 3 authentication, 4 not confirmed, 130 interrupted. See `man btrfs-snapman-cli`.
+
+### Setting up volumes from what's on disk
+`btrfs-snapman-cli discover` finds every mounted btrfs filesystem, lists its subvolumes and suggests a volume for each one that isn't configured yet:
+```
+STATUS      VOLUME   PATH                SNAPSHOTS IN
+new         docker   /media/SSD1/docker  /media/SSD1/snapshots/adhoc  (holds 2 of its snapshots with comments)
+configured  Users    /media/RAID/Users
+skipped              /media/SSD1/docker/archive/old  inside docker, whose snapshots don't include it
+```
+- Snapshots, subvolumes nested inside a suggested one (their data isn't in its snapshots), and other tools' subvolumes (Docker's or Podman's storage, Timeshift, swap) aren't suggested.
+- The snapshot folder is where its snapshots with comments already are. Folders whose snapshots are named with only a timestamp (`snapshots/docker/2026-11-16_01-00-01`) are taken to belong to a cron job and avoided, so manual snapshots don't get mixed into something else's retention or replication. Without any, it's `snapshots/<name>` at the top of the filesystem.
+- The name format is learned from the existing snapshots, so `docker_local_2026-11-16_13-44-37_Before_upgrade` gives `docker_local_{timestamp}_{label}`.
+
+Then either register them straight away, after a y/N question (`--yes` without a terminal):
+```
+btrfs-snapman-cli discover --install              # all the new ones
+btrfs-snapman-cli discover --install docker Users # or just these
+```
+or review and edit them first:
+```
+btrfs-snapman-cli discover --toml > volumes.toml  # [[volume]] tables, with the reasons as comments
+btrfs-snapman-cli register volumes.toml
+```
+Each registered volume gets its own `volumes.d/<name>.toml`, like one made with New volume, so it can be unregistered again from either front end. `config.toml` is never changed.
 
 ## Security model
 - Both front ends run as you. Every operation goes to one of three small root helpers: the GUI through `pkexec` and polkit, the terminal interface through `sudo` (there's no polkit agent over SSH), or directly when already root, e.g. from cron.
 
   | Helper | Operations | GUI (polkit) | Terminal (sudo) |
   |---|---|---|---|
-  | `snapman-query` | list | no password (active local session) | sudo timestamp |
+  | `snapman-query` | list, discover | no password (active local session) | sudo timestamp |
   | `snapman-admin` | snapshot, delete snapshot, set read-only | password, cached a few minutes | sudo timestamp (15 minutes) |
-  | `snapman-manage` | new volume, remove volume, approve / remove a location | password **every time** | password **every time** (`sudo -k`, then `sudo -v`) |
+  | `snapman-manage` | new volume, register, remove volume, approve / remove a location | password **every time** | password **every time** (`sudo -k`, then `sudo -v`) |
 
 - The terminal interface calls `sudo -n /usr/libexec/btrfs-snapman/snapman-<mode> ...` as an argument list, never through a shell. When sudo wants a password, `sudo -v` asks for it on the terminal (the full-screen interface steps aside while it does) and the call is retried once. The program never reads, stores or passes on your password. Without a terminal nothing can be asked: unattended jobs run as root, or rely on a sudoers rule.
 - Optional sudo rules are in `/usr/share/doc/btrfs-snapman-cli/examples/sudoers.example` (not installed): listing without a password for the `sudo` group, and list/snapshot rights for a dedicated `snapman` group. Install them with `sudo visudo -f /etc/sudoers.d/btrfs-snapman` and check the result with `sudo visudo -c`. Password-free listing is off by default.
 
-- The helpers accept names only, with one exception: approving a location (`add-parent PATH SNAPSHOT_ROOT`). Every other path comes from root-owned config, and the helpers refuse to start if `config.toml` is writable by anyone other than root. A drop-in file with bad permissions is skipped and reported instead.
+- The helpers accept names only, with two exceptions: approving a location (`add-parent PATH SNAPSHOT_ROOT`) and registering existing subvolumes (`register`). Every other path comes from root-owned config, and the helpers refuse to start if `config.toml` is writable by anyone other than root. A drop-in file with bad permissions is skipped and reported instead.
+- `register` only accepts a path that is an existing subvolume reached without symlinks, and a snapshot folder on the same filesystem that isn't a system location and doesn't directly contain any volume's live subvolume (so deleting a snapshot there can't hit one). Everything in a batch is checked before anything is written.
 - `add-parent` only accepts two absolute, existing, real directories (no symlink anywhere in the path) on the **same** btrfs filesystem, compared by fsid. It refuses `/`, `/boot`, `/etc`, `/usr`, `/var/lib`, and anything under `/proc`, `/sys` or `/dev`.
 - The tool **never edits `config.toml`**. Volumes created in either front end are written to `volumes.d/<name>.toml`, and approved locations to `parents.d/<path>.toml`, one file each; removing the volume or location deletes that file. Anything defined in `config.toml` can't be removed from the tool.
 - Snapshot deletes are confined to the volume's snapshot folder; symlinks and `..` are rejected.
@@ -71,7 +97,7 @@ btrfs-snapman-cli                 # full screen in a terminal
 ```
 `install.sh` installs `build-essential` and `debhelper` if they're missing, builds the packages with `dpkg-buildpackage -us -uc -b`, and installs them with `apt`, which pulls in the dependencies. Copies of the `.deb`s are left in the source folder. Release builds are also attached to each [GitHub release](https://github.com/DarthDogCow/btrfs-snapman/releases). On a headless machine such as a Raspberry Pi (the packages are `Architecture: all`, so the same files work on arm64):
 ```
-sudo apt install ./btrfs-snapman-common_0.7.0_all.deb ./btrfs-snapman-cli_0.7.0_all.deb
+sudo apt install ./btrfs-snapman-common_<version>_all.deb ./btrfs-snapman-cli_<version>_all.deb
 ```
 
 | Path | |
@@ -144,17 +170,17 @@ Then use **New volume → Use existing subvolume** with the same folder name (or
 ## Tests
 | Test | Run as | What it covers |
 |---|---|---|
-| `python3 tests/test_client.py` | you | `snapman_client.py`: comment cleaning, name preview, the remove summaries, helper result classification, the snapshot-root rule |
-| `sudo PY=/usr/bin/python3 tests/test_core.sh src` | root | 146 checks against the helpers on two 1 GB loopback btrfs filesystems: snapshots, hooks, path and symlink confinement, the received-snapshot guard, mounted and nested snapshots, drop-in loading and permissions, new-volume rollback, remove-volume with each option (including refusal while a file is open), add-parent / remove-parent, and the caller UID in the journal |
-| `sudo PY=/usr/bin/python3 tests/test_cli.sh src` | root | every `btrfs-snapman-cli` subcommand on loopback btrfs: exit codes, stdout/stderr split, `--json`, confirmations with and without a terminal |
+| `python3 tests/test_client.py` | you | `snapman_client.py`: comment cleaning, name preview, the remove summaries, helper result classification, the snapshot-root rule, and discover's suggestions on server- and laptop-shaped layouts |
+| `sudo PY=/usr/bin/python3 tests/test_core.sh src` | root | 181 checks against the helpers on two 1 GB loopback btrfs filesystems: snapshots, hooks, path and symlink confinement, the received-snapshot guard, mounted and nested snapshots, drop-in loading and permissions, new-volume rollback, remove-volume with each option (including refusal while a file is open), add-parent / remove-parent, discover and register (including every refusal), and the caller UID in the journal |
+| `sudo PY=/usr/bin/python3 tests/test_cli.sh src` | root | every `btrfs-snapman-cli` subcommand on loopback btrfs, including discover and register: exit codes, stdout/stderr split, `--json`, confirmations with and without a terminal |
 | `sudo PY=/usr/bin/python3 tests/test_tui.sh src` | root, needs `tmux` | the full-screen interface at 80×24 through `tmux send-keys` / `capture-pane`: every dialog, checked on screen and on disk, plus resizing, `LANG=C`, `TERM=screen`/`linux` and `NO_COLOR` |
 
 These three create and remove users, packages or `/etc` files, so run them **only on a disposable VM or container** (Ubuntu 24.04):
 
 | Test | What it covers |
 |---|---|
-| `sudo tests/test_sudo.sh` | with the 0.7.0 packages installed: the first `sudo -v`, timestamp reuse and expiry, manage verbs asking every time, a wrong password (exit 3), the TUI stepping aside for sudo, the sudoers example, and that the password never shows in the process list |
-| `sudo tests/test_upgrade.sh OLD.deb NEW_DIR` | 0.6.0 → 0.7.0: an edited `config.toml` survives byte-identical with no prompt and no `.dpkg-*` files, `volumes.d` is untouched, and `btrfs-snapman-common` owns the conffile |
+| `sudo tests/test_sudo.sh` | with the packages installed: the first `sudo -v`, timestamp reuse and expiry, manage verbs asking every time, a wrong password (exit 3), the TUI stepping aside for sudo, the sudoers example, and that the password never shows in the process list |
+| `sudo tests/test_upgrade.sh OLD.deb NEW_DIR` | 0.6.0 (one package) → the split packages: an edited `config.toml` survives byte-identical with no prompt and no `.dpkg-*` files, `volumes.d` is untouched, and `btrfs-snapman-common` owns the conffile |
 | `tests/test_headless.sh NEW_DIR` | installing common + CLI pulls in no GTK, gir, pkexec or polkit |
 
 Build the packages with `dpkg-buildpackage -us -uc -b` and check them with `lintian --fail-on error,warning *.changes`. For the upgrade test, build the 0.6.0 package from its tag: `git archive --prefix=btrfs-snapman/ v0.6.0 | tar x -C /tmp`, then `dpkg-buildpackage -us -uc -b` in `/tmp/btrfs-snapman`.

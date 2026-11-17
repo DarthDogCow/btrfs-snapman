@@ -1,4 +1,4 @@
-.TH BTRFS-SNAPMAN-CLI 1 "November 2026" "btrfs-snapman 0.7.0" "User Commands"
+.TH BTRFS-SNAPMAN-CLI 1 "November 2026" "btrfs-snapman 0.8.0" "User Commands"
 .SH NAME
 btrfs-snapman-cli \- terminal manager for btrfs subvolume snapshots
 .SH SYNOPSIS
@@ -103,6 +103,43 @@ at the top of the same filesystem).
 .BR remove\-location " \fIpath\fR [" \-\-yes ]
 Withdraw an approved location.
 Volumes already there stay registered.
+.TP
+.BR discover " [" \-\-toml " | " \-\-install " [\fIname\fR ...]] [" \-\-yes ]
+Find the subvolumes on every mounted btrfs filesystem and suggest volumes for
+the ones not yet configured.
+Snapshots, subvolumes nested inside a suggested one, and subvolumes of other
+tools (container storage, Timeshift, swap) are not suggested.
+Each suggestion's snapshot folder is the one holding its snapshots with
+comments; folders whose snapshots have only a timestamp in their name are
+taken to belong to a scheduled job and avoided.
+The name format is learned from the snapshots already there.
+.B \-\-toml
+prints the suggestions as
+.B [[volume]]
+tables to review and edit;
+.B \-\-install
+registers them (all new ones, or the named ones) after asking, or with
+.BR \-\-yes .
+.TP
+.BR register " \fIfile\fR [" \-\-yes ]
+Register existing subvolumes from a TOML file of
+.B [[volume]]
+tables with
+.BR name ,
+.BR path ,
+.B snapshot_dir
+and optionally
+.B name_format
+and
+.BR timestamp_format ,
+such as edited
+.B discover \-\-toml
+output.
+Each becomes a file in
+.IR /etc/btrfs-snapman/volumes.d ,
+so it can be unregistered like any volume created with the tool.
+Missing snapshot folders are created.
+All volumes in the file are registered, or none.
 .SH OPTIONS
 .TP
 .B \-\-json
@@ -126,9 +163,9 @@ When sudo needs a password,
 .B sudo \-v
 asks for it on the terminal (outside the full-screen interface) and the call
 is retried once.
-Listing and snapshot changes use the sudo timestamp; creating or removing a
-volume, or approving or withdrawing a location, asks for the password every
-time.
+Listing, discovering and snapshot changes use the sudo timestamp; creating,
+registering or removing a volume, or approving or withdrawing a location, asks
+for the password every time.
 Without a terminal nothing can be asked, so unattended use needs root or a
 sudoers rule; see
 .IR /usr/share/doc/btrfs-snapman-cli/examples/sudoers.example .
