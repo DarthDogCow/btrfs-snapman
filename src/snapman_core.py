@@ -537,20 +537,28 @@ def _btrfs_mounts(mountinfo="/proc/self/mountinfo"):
     return found
 
 
+def _mount_path(mount_point, root, fs_path):
+    """Where fs_path appears under a mount of root, or None if that mount doesn't show it.
+
+    Joined by hand: normpath keeps a leading "//", which a mount on / would otherwise give
+    ("/" + "/snapshots" -> "//snapshots").
+    """
+    p, r = "/" + fs_path.strip("/"), root.rstrip("/")
+    if p != r and not p.startswith(r + "/"):
+        return None
+    return os.path.normpath(mount_point.rstrip("/") + p[len(r):]) if p != r else mount_point
+
+
 def _reachable(fs_path, sid, mounts):
     """Where subvolume fs_path (relative to the top level) can be reached, or None.
 
     The mount showing the shallowest part of the filesystem wins, so a top-level mount
     (/media/SSD1/docker) is preferred to a second mount of the same subvolume.
     """
-    p = "/" + fs_path
     for mp, root in sorted(mounts, key=lambda m: len(m[1])):
-        r = root.rstrip("/")
-        if p != r and not p.startswith(r + "/"):
-            continue
-        cand = os.path.normpath(mp + p[len(r):])
+        cand = _mount_path(mp, root, fs_path)
         try:
-            if os.path.isdir(cand) and btrfsutil.subvolume_id(cand) == sid:
+            if cand and os.path.isdir(cand) and btrfsutil.subvolume_id(cand) == sid:
                 return cand
         except (OSError, btrfsutil.BtrfsUtilError):
             pass

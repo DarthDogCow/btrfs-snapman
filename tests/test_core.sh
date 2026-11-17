@@ -318,6 +318,16 @@ assert "  subvolumes reachable via the top level" [ "$(fs "s['@data']['reachable
 assert "  nested subvolume found"               [ "$(fs "s['@reg1/inner']['reachable']")" = "$MNT/@reg1/inner" ]
 assert "  snapshot: read-only, parent uuid"     [ "$(fs "s['snapshots/vms/manual-old']['read_only'] and s['snapshots/vms/manual-old']['parent_uuid'] == s['@vms']['uuid']")" = True ]
 assert "  received snapshot flagged"            [ "$(fs "s['snapshots/data/manual-old']['received']")" = True ]
+# Where a subvolume shows under a mount; a mount on / must not give "//snapshots/..."
+mp() { "$PY" -I -c "import sys; sys.path.insert(0, '$SRC'); import snapman_core as c; print(c._mount_path(*sys.argv[1:]))" "$@"; }
+assert "mount path: under a mount of / (laptop)"    [ "$(mp / /@ @/snapshots/home/Home_1)" = /snapshots/home/Home_1 ]
+assert "mount path: the mounted subvolume itself"   [ "$(mp / /@ @)" = / -a "$(mp /home /@home @home)" = /home ]
+assert "mount path: top level mounted elsewhere"    [ "$(mp /media/SSD1 / docker/archive)" = /media/SSD1/docker/archive ]
+assert "mount path: not shown by that mount"        [ "$(mp / /@ @home)" = None -a "$(mp / /@ @x/y)" = None ]
+btrfs -q subvolume create "$MNT/@data/sub" >/dev/null
+check "discover again"                          ok   query discover
+assert "  reached through a subvolume mount only" [ "$(echo "$LAST" | "$PY" -c "import sys; sys.path.insert(0, '$SRC'); import snapman_core as c, btrfsutil; print(c._reachable('@data/sub', btrfsutil.subvolume_id('$MNT/@data/sub'), [('$DATAMNT', '/@data')]))")" = "$DATAMNT/sub" ]
+btrfs -q subvolume delete "$MNT/@data/sub" >/dev/null
 umount "$DATAMNT"
 check "admin helper refuses register"           fail admin register a "$MNT/@reg1" "$MNT/rs" - -
 check "register: not a multiple of five"        fail manage register a "$MNT/@reg1" "$MNT/rs" -

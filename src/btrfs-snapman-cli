@@ -36,7 +36,7 @@ from snapman_client import (LIBEXEC, NAME_RE, fmt_age, fmt_time, helper_argv,  #
                             render_toml, sanitise_label, suggest_snapshot_root,
                             suggest_volumes)
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 
 # Exit codes
 EXIT_FAILED = 1         # the helper refused or failed

@@ -1,3 +1,10 @@
+btrfs-snapman (0.8.2) noble; urgency=medium
+
+  * discover: paths of subvolumes reached through a filesystem mounted on /
+    came out as "//snapshots/home", which register then refused.
+
+ -- DarthDogCow <157978722+DarthDogCow@users.noreply.github.com>  Tue, 17 Nov 2026 12:24:54 +0000
+
 btrfs-snapman (0.8.1) noble; urgency=medium
 
   * discover: a folder of a volume's own snapshots taken without a comment
