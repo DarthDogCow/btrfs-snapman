@@ -17,7 +17,7 @@ assert() {
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get install -y -q "$OLD" >/dev/null 2>&1
-assert "0.6.0 installed"                      dpkg-query -W -f='${Status}' btrfs-snapman
+assert "0.6.0 installed"                      eval '[ "$(dpkg-query -W -f="\${Version}" btrfs-snapman)" = 0.6.0 ]'
 # Edit the conffile the way an admin would, and add a GUI-style drop-in
 printf '\n# edited by hand before the upgrade\n' >> "$ETC/config.toml"
 printf '[volume]\nname = "keep"\npath = "/srv/keep"\nsnapshot_dir = "/srv/snapshots/keep"\n' \
