@@ -2,15 +2,15 @@
 btrfs-snapman core: the only code that runs as root.
 
 It is called by three tiny entry scripts, each with its own polkit rule:
-  snapman-query   list                                  no password (active session)
+  snapman-query   list | discover                       no password (active session)
   snapman-admin   snapshot | delete | set-ro            password, cached a few minutes
   snapman-manage  new-volume | remove-volume |          password every time
-                  add-parent | remove-parent
+                  add-parent | remove-parent | register
 
 Design rules
-  * A fixed set of operations. The GUI passes names, never arbitrary paths, except to
-    add-parent, which checks both paths (real directories, same btrfs filesystem, not a
-    system location) before approving them.
+  * A fixed set of operations. The front ends pass names, never arbitrary paths, except
+    to add-parent and register, which check every path (real directories, same btrfs
+    filesystem, not a system location) before writing it to a drop-in.
   * Every path comes from root-owned config:
       /etc/btrfs-snapman/config.toml        hand-written: defaults, create parents, volumes
       /etc/btrfs-snapman/volumes.d/*.toml   one file per volume; the tool writes and removes these
@@ -63,8 +63,10 @@ FORBIDDEN_TREES = ("/proc", "/sys", "/dev")
 
 HOOK_TIMEOUT = 120
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
-DROPIN_HEADER = ("# Managed by btrfs-snapman. Created via the GUI; removing the volume in the\n"
-                 "# GUI deletes this file. Safe to edit by hand (e.g. to add hooks).\n")
+BTRFS_SUBVOL_RDONLY = 1 << 0                                            # SubvolumeInfo.flags
+FORMAT_RE = re.compile(r"^[A-Za-z0-9._{}-]{1,100}$")                    # name_format we will write
+DROPIN_HEADER = ("# Managed by btrfs-snapman. Removing the volume in btrfs-snapman deletes this\n"
+                 "# file. Safe to edit by hand (e.g. to add hooks).\n")
 PARENT_HEADER = ("# Managed by btrfs-snapman. Approved via New volume > Browse; remove it with\n"
                  "# 'snapman-manage remove-parent PATH' or by deleting this file.\n")
 
@@ -106,10 +108,8 @@ def _parse_volume(v, defaults, origin, origin_file):
                 raise SnapError(f"volume {name}: hook command must be an absolute path: {c[0]}")
         hooks[key] = cmds
 
-    # Check the timestamp format can only produce characters that are safe in a filename.
     tsf = v.get("timestamp_format", defaults["timestamp_format"])
-    if not re.fullmatch(r"[A-Za-z0-9._+-]*", _dt.datetime(2000, 1, 2, 3, 4, 5).strftime(tsf)):
-        raise SnapError(f"volume {name}: timestamp_format must produce only [A-Za-z0-9._+-]")
+    _check_timestamp_format(name, tsf)
 
     return {
         "name": name,
@@ -123,6 +123,12 @@ def _parse_volume(v, defaults, origin, origin_file):
         "origin": origin,              # "config" (config.toml) or "dropin" (volumes.d)
         "origin_file": origin_file,
     }
+
+
+def _check_timestamp_format(name, tsf):
+    """The timestamp format may only produce characters that are safe in a filename."""
+    if not re.fullmatch(r"[A-Za-z0-9._+-]*", _dt.datetime(2000, 1, 2, 3, 4, 5).strftime(tsf)):
+        raise SnapError(f"volume {name}: timestamp_format must produce only [A-Za-z0-9._+-]")
 
 
 def _parse_parent(p, origin, origin_file):
@@ -430,12 +436,14 @@ def _toml_str(s):
     return json.dumps(s)
 
 
-def _write_dropin(cfg, name, path, snapshot_dir):
-    """Write volumes.d/<name>.toml."""
+def _write_dropin(cfg, name, path, snapshot_dir, extra=None):
+    """Write volumes.d/<name>.toml; extra holds optional string settings such as name_format."""
     body = (DROPIN_HEADER + "\n[volume]\n"
             f"name = {_toml_str(name)}\n"
             f"path = {_toml_str(path)}\n"
             f"snapshot_dir = {_toml_str(snapshot_dir)}\n")
+    for key, value in (extra or {}).items():
+        body += f"{key} = {_toml_str(value)}\n"
     return _atomic_write(cfg["dropin_dir"], f"{name}.toml", body)
 
 
@@ -514,6 +522,74 @@ def op_list(cfg):
             entry["error"] = str(e)
         out["volumes"].append(entry)
     return out, [], []
+
+
+def _btrfs_mounts(mountinfo="/proc/self/mountinfo"):
+    """Mounted btrfs filesystems: {major:minor: [(mount point, subvolume path it shows)]}."""
+    unescape = lambda t: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), t)
+    found = {}
+    with open(mountinfo) as f:
+        for line in f:
+            pre, _, post = line.partition(" - ")
+            fields, post_fields = pre.split(), post.split()
+            if len(fields) >= 5 and post_fields and post_fields[0] == "btrfs":
+                found.setdefault(fields[2], []).append((unescape(fields[4]), unescape(fields[3])))
+    return found
+
+
+def _reachable(fs_path, sid, mounts):
+    """Where subvolume fs_path (relative to the top level) can be reached, or None.
+
+    The mount showing the shallowest part of the filesystem wins, so a top-level mount
+    (/media/SSD1/docker) is preferred to a second mount of the same subvolume.
+    """
+    p = "/" + fs_path
+    for mp, root in sorted(mounts, key=lambda m: len(m[1])):
+        r = root.rstrip("/")
+        if p != r and not p.startswith(r + "/"):
+            continue
+        cand = os.path.normpath(mp + p[len(r):])
+        try:
+            if os.path.isdir(cand) and btrfsutil.subvolume_id(cand) == sid:
+                return cand
+        except (OSError, btrfsutil.BtrfsUtilError):
+            pass
+    return None
+
+
+def op_discover(cfg):
+    """Every mounted btrfs filesystem and all of its subvolumes, for btrfs-snapman-cli discover.
+
+    Read-only. Suggesting volumes from this is left to the front end (snapman_client).
+    """
+    filesystems = []
+    for _dev, mounts in sorted(_btrfs_mounts().items()):
+        mounts = sorted(set(mounts))
+        fs = {"fsid": None, "label": "", "mounts": [{"path": mp, "subvol": root}
+                                                    for mp, root in mounts],
+              "subvolumes": [], "error": None}
+        try:
+            mp0 = min(mounts, key=lambda m: len(m[1]))[0]
+            fs["fsid"] = _fsid(mp0)
+            try:
+                with open(f"/sys/fs/btrfs/{fs['fsid']}/label") as f:
+                    fs["label"] = f.read().strip()
+            except OSError:
+                pass
+            it = btrfsutil.SubvolumeIterator(mp0, top=5, info=True)
+            for path, info in it:
+                fs["subvolumes"].append({
+                    "id": info.id, "parent_id": info.parent_id, "path": path,
+                    "reachable": _reachable(path, info.id, mounts),
+                    "uuid": _uuid_str(info.uuid), "parent_uuid": _uuid_str(info.parent_uuid),
+                    "received": _uuid_str(info.received_uuid) != NIL_UUID,
+                    "read_only": bool(info.flags & BTRFS_SUBVOL_RDONLY),
+                    "otime": info.otime,
+                })
+        except (SnapError, OSError, btrfsutil.BtrfsUtilError) as e:
+            fs["error"] = str(e)
+        filesystems.append(fs)
+    return {"filesystems": filesystems}, [], []
 
 
 # =========================================================================== admin
@@ -868,15 +944,117 @@ def op_remove_parent(cfg, path):
         [f"# removed {par['origin_file']}"], warnings
 
 
+def _check_register(cfg, item, sources):
+    """Validate one volume for register; returns the folders to create for its snapshots.
+
+    PATH must be an existing subvolume reached without symlinks. SNAPSHOT_DIR must be on
+    the same filesystem, not a system location, and must not directly hold any volume's
+    source, so deleting a snapshot there can never hit a live subvolume.
+    """
+    name, path, snapdir = item["name"], item["path"], item["snapshot_dir"]
+    if not NAME_RE.match(name):
+        raise SnapError(f"invalid volume name: {name!r}")
+    if name in cfg["volumes"]:
+        raise SnapError(f"a volume called {name} already exists")
+    if os.path.lexists(os.path.join(cfg["dropin_dir"], f"{name}.toml")):
+        raise SnapError(f"{cfg['dropin_dir']}/{name}.toml already exists")
+    for what, p in (("path", path), ("snapshot_dir", snapdir)):
+        if not os.path.isabs(p) or os.path.normpath(p) != p:
+            raise SnapError(f"{name}: {what} must be an absolute path without '..', '//' or "
+                            f"a trailing '/': {p!r}")
+        if not SAFE_PATH_RE.match(p):
+            raise SnapError(f"{name}: {what} contains characters this tool won't write to "
+                            f"config: {p}")
+        if any(p == t or p.startswith(t + "/") for t in FORBIDDEN_TREES):
+            raise SnapError(f"{name}: {what} {p} is a system location; refusing")
+    if os.path.realpath(path) != path or not os.path.isdir(path):
+        raise SnapError(f"{name}: {path} is not a real folder (missing, or through a symlink)")
+    if not btrfsutil.is_subvolume(path):
+        raise SnapError(f"{name}: {path} is not a btrfs subvolume")
+    fsid = _fsid(path)
+
+    if snapdir in FORBIDDEN_LOCATIONS:
+        raise SnapError(f"{name}: snapshot_dir {snapdir} is a system location; refusing")
+    if snapdir == path:
+        raise SnapError(f"{name}: snapshot_dir must not be the subvolume itself")
+    held = [s for s in sources if os.path.dirname(s) == snapdir]
+    if held:
+        raise SnapError(f"{name}: snapshot_dir {snapdir} holds the live subvolume {held[0]}; "
+                        "snapshots must go in a folder of their own")
+    # The nearest existing folder decides the filesystem; missing ones below it are created.
+    create, d = [], snapdir
+    while not os.path.lexists(d):
+        create.insert(0, d)
+        d = os.path.dirname(d)
+    if os.path.islink(d) or not os.path.isdir(d) or os.path.realpath(d) != d:
+        raise SnapError(f"{name}: {d} is not a real folder (a file, or through a symlink)")
+    if _fsid(d) != fsid:
+        raise SnapError(f"{name}: {snapdir} is not on the same btrfs filesystem as {path}")
+
+    if item["name_format"] is not None:
+        nf = item["name_format"]
+        try:
+            sample = nf.format(volume=name, timestamp="20000102-030405", label="x")
+        except (KeyError, IndexError, ValueError):
+            raise SnapError(f"{name}: name_format may only use {{volume}}, {{timestamp}} and "
+                            f"{{label}}: {nf!r}") from None
+        if not FORMAT_RE.match(nf) or "{timestamp}" not in nf or not ENTRY_RE.match(sample):
+            raise SnapError(f"{name}: name_format must include {{timestamp}} and produce a "
+                            f"plain name: {nf!r}")
+    if item["timestamp_format"] is not None:
+        _check_timestamp_format(name, item["timestamp_format"])
+    return create
+
+
+def op_register(cfg, items):
+    """Register existing subvolumes as volumes: one volumes.d/<name>.toml each.
+
+    All of them are checked before anything is written, and a failure part-way through
+    undoes the earlier steps, so a batch is registered completely or not at all.
+    """
+    names = [it["name"] for it in items]
+    dup = next((n for n in names if names.count(n) > 1), None)
+    if dup:
+        raise SnapError(f"volume name {dup} is given twice")
+    sources = [os.path.realpath(v["path"]) for v in cfg["volumes"].values()] + \
+        [it["path"] for it in items]
+    creates = [_check_register(cfg, it, sources) for it in items]
+
+    commands, undo, files = [], [], []
+    try:
+        for it, create in zip(items, creates):
+            for d in create:
+                if not os.path.isdir(d):        # an earlier item may have made it already
+                    os.mkdir(d, 0o755)
+                    undo.append(lambda d=d: os.rmdir(d))
+                    commands.append(_q("mkdir", d))
+            extra = {k: it[k] for k in ("name_format", "timestamp_format") if it[k] is not None}
+            target = _write_dropin(cfg, it["name"], it["path"], it["snapshot_dir"], extra)
+            undo.append(lambda t=target: os.unlink(t))
+            commands.append(f"# wrote {target}")
+            files.append(target)
+    except BaseException:
+        for fn in reversed(undo):
+            try:
+                fn()
+            except Exception:
+                pass
+        raise
+    for it in items:
+        _log(f"register {it['name']}: path={it['path']} snapshot_dir={it['snapshot_dir']}")
+    return {"registered": names, "files": files}, commands, []
+
+
 # =========================================================================== entry point
 
 USAGE = {
-    "query": "list",
+    "query": "list | discover",
     "admin": "snapshot VOLUME [COMMENT] [--ro|--rw] | delete VOLUME SNAPSHOT | "
              "set-ro VOLUME SNAPSHOT true|false [--force]",
     "manage": "new-volume NAME PARENT [FOLDER] [--nocow] [--existing] | "
               "remove-volume NAME [--delete-data] [--no-final-snapshot] [--delete-snapshots] | "
-              "add-parent PATH SNAPSHOT_ROOT | remove-parent PATH",
+              "add-parent PATH SNAPSHOT_ROOT | remove-parent PATH | "
+              "register NAME PATH SNAPSHOT_DIR NAME_FORMAT TIMESTAMP_FORMAT [NAME ...]",
 }
 
 
@@ -891,6 +1069,8 @@ def dispatch(mode, argv, cfg):
     if mode == "query":
         if verb == "list" and not args:
             return op_list(cfg)
+        if verb == "discover" and not args:
+            return op_discover(cfg)
 
     elif mode == "admin":
         if verb == "snapshot" and 1 <= len(pos) <= 2 and flags <= {"--ro", "--rw"} \
@@ -919,6 +1099,13 @@ def dispatch(mode, argv, cfg):
             return op_add_parent(cfg, *pos)
         if verb == "remove-parent" and len(pos) == 1 and not flags:
             return op_remove_parent(cfg, pos[0])
+        # register takes groups of five; "-" for a format means "use [defaults]"
+        if verb == "register" and args and len(args) % 5 == 0 and not flags:
+            items = [{"name": args[i], "path": args[i + 1], "snapshot_dir": args[i + 2],
+                      "name_format": None if args[i + 3] == "-" else args[i + 3],
+                      "timestamp_format": None if args[i + 4] == "-" else args[i + 4]}
+                     for i in range(0, len(args), 5)]
+            return op_register(cfg, items)
 
     raise SnapError("usage: " + USAGE[mode])
 

@@ -158,5 +158,49 @@ assert "add-location --snapshot-root"                   eval 'rc 0 && [ -d "$MNT
 tty "delete" remove-location "$MNT/second"
 assert "remove-location on a terminal: exit 0"          eval 'rc 0 && ! ls "$CFGDIR"/parents.d/*.toml >/dev/null 2>&1'
 
+# ---------------------------------------------------------------- discover / register
+btrfs -q subvolume create "$MNT/@media" >/dev/null
+mkdir -p "$MNT/snapshots/adhoc"
+btrfs -q subvolume snapshot -r "$MNT/@media" "$MNT/snapshots/adhoc/media_2026-01-02_10-00-00_First_copy" >/dev/null
+btrfs -q subvolume create "$MNT/@files" >/dev/null
+cli discover
+assert "discover: exit 0"                               rc 0
+assert "  configured volume marked"                     has "^configured +Docker +$MNT/@docker" "$OUT"
+assert "  new one, with its labelled snapshots' folder" has "^new +media +$MNT/@media +$MNT/snapshots/adhoc +\(holds 1 of its snapshots with comments\)$" "$OUT"
+assert "  snapshots are not suggested"                  eval '! has "snapshots/adhoc/media_" "$OUT"'
+assert "  hint on stderr"                               has -- "--install" "$ERR"
+cli --json discover
+assert "--json discover: the helper's object"           eval 'rc 0 && [ "$OUT" = "$(helper query discover)" ]'
+cli discover --toml
+assert "--toml: valid TOML with the suggestions"        eval 'rc 0 && "$PY" -c "import sys, tomllib; d = tomllib.loads(sys.stdin.read()); v = {x[\"name\"]: x for x in d[\"volume\"]}; sys.exit(0 if v[\"media\"][\"name_format\"] == \"{volume}_{timestamp}_{label}\" and v[\"media\"][\"timestamp_format\"] == \"%Y-%m-%d_%H-%M-%S\" else 1)" <<<"$OUT"'
+assert "  configured ones as comments"                  has "^# $MNT/@docker: already configured as Docker$" "$OUT"
+cli discover media
+assert "names without --install: exit 2"                rc 2
+cli discover --install media
+assert "--install without a terminal: exit 4"           eval 'rc 4 && [ ! -e "$CFGDIR/volumes.d/media.toml" ]'
+assert "  plan shown first"                             has "media +$MNT/@media -> $MNT/snapshots/adhoc" "$ERR"
+cli discover --install nope --yes
+assert "--install unknown name: exit 1"                 eval 'rc 1 && has "not a new suggestion: nope" "$ERR"'
+cli discover --install media --yes
+assert "--install media --yes: registered"              eval 'rc 0 && has "^Registered media$" "$OUT" && grep -q "name_format = \"{volume}_{timestamp}_{label}\"" "$CFGDIR/volumes.d/media.toml"'
+cli snapshot media "second copy"
+assert "  snapshots land next to the old ones"          eval 'rc 0 && [ -d "$MNT/snapshots/adhoc/$OUT" ] && has "^media_[0-9-]+_[0-9-]+_second_copy$" "$OUT"'
+cli discover
+assert "  now listed as configured"                     has "^configured +media" "$OUT"
+
+printf '[[volume]]\nname = "files"\npath = "%s"\nsnapshot_dir = "%s"\n' "$MNT/@files" "$MNT/snapshots/files" > "$WORK/files.toml"
+printf '[[volume]]\nname = "bad"\npath = "%s"\nsnapshot_dir = "%s"\n' "$MNT/@files" "$MNT" > "$WORK/bad.toml"
+printf 'not toml' > "$WORK/junk.toml"
+cli register "$WORK/junk.toml" --yes
+assert "register: unreadable TOML: exit 1"              eval 'rc 1 && has "not valid TOML" "$ERR"'
+cli register "$WORK/bad.toml" --yes
+assert "register: helper refuses a folder of live subvolumes" eval 'rc 1 && has "holds the live subvolume" "$ERR"'
+tty "n" register "$WORK/files.toml"
+assert "register on a terminal, n: exit 4"              eval 'rc 4 && [ ! -e "$CFGDIR/volumes.d/files.toml" ]'
+tty "y" register "$WORK/files.toml"
+assert "register on a terminal, y: registered"          eval 'rc 0 && [ -f "$CFGDIR/volumes.d/files.toml" -a -d "$MNT/snapshots/files" ]'
+cli remove-volume files --yes
+assert "  and unregistered again"                       eval 'rc 0 && [ ! -e "$CFGDIR/volumes.d/files.toml" ]'
+
 echo; echo "passed=$pass failed=$fail"
 [ $fail -eq 0 ]

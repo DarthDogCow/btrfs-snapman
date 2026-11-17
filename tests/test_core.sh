@@ -16,7 +16,7 @@ pass=0; fail=0
 # Always unmount and clean up, even if a test blows up.
 cleanup() {
   kill $HOLDER 2>/dev/null
-  umount "$MNT/mounted" "$MNT" "$MNT2" "$WORK/tmpfs" 2>/dev/null
+  umount "$MNT/mounted" "$WORK/datamnt" "$MNT" "$MNT2" "$WORK/tmpfs" 2>/dev/null
   rm -rf "$WORK"
 }
 HOLDER=""
@@ -304,6 +304,52 @@ assert "  parent gone, volume still listed"     [ "$(field "[p['path'] for p in 
 check "new-volume under removed parent refused" fail manage new-volume Late "$MNT/approved" late
 check "approve it again"                        ok   manage add-parent "$MNT/approved" "$MNT/approved-snaps"
 assert "  same file name"                       [ "$(field "d['result']['origin_file']")" = "$PFILE" ]
+
+# ---------------------------------------------------------------- discover / register
+btrfs -q subvolume create "$MNT/@reg1" >/dev/null
+btrfs -q subvolume create "$MNT/@reg2" >/dev/null
+btrfs -q subvolume create "$MNT/@reg1/inner" >/dev/null
+DATAMNT=$WORK/datamnt; mkdir -p "$DATAMNT" && mount -o loop,subvol=@data "$IMG" "$DATAMNT"
+check "discover works"                          ok   query discover
+# fs(): the test filesystem's entry; sub(PATH): one of its subvolumes, by path in the fs
+fs() { echo "$LAST" | "$PY" -c "import json,sys; d=json.load(sys.stdin); f=[f for f in d['result']['filesystems'] if any(m['path']=='$MNT' for m in f['mounts'])][0]; s={x['path']:x for x in f['subvolumes']}; print(eval(sys.argv[1]))" "$1"; }
+assert "  both mounts of it listed"             [ "$(fs "sorted(m['path'] for m in f['mounts'])")" = "['$DATAMNT', '$MNT']" ]
+assert "  subvolumes reachable via the top level" [ "$(fs "s['@data']['reachable']")" = "$MNT/@data" ]
+assert "  nested subvolume found"               [ "$(fs "s['@reg1/inner']['reachable']")" = "$MNT/@reg1/inner" ]
+assert "  snapshot: read-only, parent uuid"     [ "$(fs "s['snapshots/vms/manual-old']['read_only'] and s['snapshots/vms/manual-old']['parent_uuid'] == s['@vms']['uuid']")" = True ]
+assert "  received snapshot flagged"            [ "$(fs "s['snapshots/data/manual-old']['received']")" = True ]
+umount "$DATAMNT"
+check "admin helper refuses register"           fail admin register a "$MNT/@reg1" "$MNT/rs" - -
+check "register: not a multiple of five"        fail manage register a "$MNT/@reg1" "$MNT/rs" -
+check "register: plain folder refused"          fail manage register a "$MNT/vmdisks" "$MNT/rs" - -
+assert "  says not a subvolume"                 grep -q "not a btrfs subvolume" <<<"$LAST"
+ln -s "$MNT/@reg1" "$MNT/reglink"
+check "register: symlinked path refused"        fail manage register a "$MNT/reglink" "$MNT/rs" - -
+check "register: relative path refused"         fail manage register a "@reg1" "$MNT/rs" - -
+check "register: existing name refused"         fail manage register vms "$MNT/@reg1" "$MNT/rs" - -
+check "register: same name twice refused"       fail manage register a "$MNT/@reg1" "$MNT/rs" - - a "$MNT/@reg2" "$MNT/rs" - -
+check "register: snapshot_dir holding live subvolumes" fail manage register a "$MNT/@reg1" "$MNT" - -
+assert "  says why"                             grep -q "holds the live subvolume" <<<"$LAST"
+check "register: snapshot_dir = path refused"   fail manage register a "$MNT/@reg1" "$MNT/@reg1" - -
+check "register: other filesystem refused"      fail manage register a "$MNT/@reg1" "$MNT2/rs" - -
+check "register: system location refused"       fail manage register a "$MNT/@reg1" /etc - -
+check "register: name_format without timestamp" fail manage register a "$MNT/@reg1" "$MNT/rs" "{volume}_{label}" -
+check "register: unknown name_format field"     fail manage register a "$MNT/@reg1" "$MNT/rs" "{evil}{timestamp}" -
+check "register: name_format with a slash"      fail manage register a "$MNT/@reg1" "$MNT/rs" "a/{timestamp}" -
+check "register: bad timestamp_format"          fail manage register a "$MNT/@reg1" "$MNT/rs" - "%Y/%m"
+check "register: bad second volume, none written" fail manage register a "$MNT/@reg1" "$MNT/rs" - - b "$MNT/nope" "$MNT/rs" - -
+assert "refusals wrote nothing"                 [ ! -e "$CFGDIR/volumes.d/a.toml" -a ! -e "$CFGDIR/volumes.d/b.toml" -a ! -e "$MNT/rs" ]
+rm "$MNT/reglink"
+check "register two volumes in one call"        ok   manage register reg1 "$MNT/@reg1" "$MNT/regsnaps/reg1" "r1-{timestamp}_{label}" "%Y%m%d" reg2 "$MNT/@reg2" "$MNT/regsnaps/shared" - -
+assert "  missing folders created"              [ -d "$MNT/regsnaps/reg1" -a -d "$MNT/regsnaps/shared" ]
+assert "  formats written only when given"      eval 'grep -q "name_format = \"r1-{timestamp}_{label}\"" "$CFGDIR/volumes.d/reg1.toml" && ! grep -q name_format "$CFGDIR/volumes.d/reg2.toml"'
+check "  list shows them, managed"              ok   query list
+assert "  removable, no error"                  [ "$(vol "(v['reg1']['removable'], v['reg2']['error'])")" = "(True, None)" ]
+check "  snapshot uses the name format"         ok   admin snapshot reg1 first
+assert "  named r1-<date>_first"                [ "$(field "d['result']['name']")" = "r1-$(date +%Y%m%d)_first" ]
+check "  already registered: refused"           fail manage register reg1 "$MNT/@reg1" "$MNT/regsnaps/reg1" - -
+check "  unregister works as for any drop-in"   ok   manage remove-volume reg2
+assert "  file gone, data kept"                 [ ! -e "$CFGDIR/volumes.d/reg2.toml" -a -d "$MNT/@reg2" ]
 
 # ---------------------------------------------------------------- config hardening
 chmod 666 "$CFGDIR/config.toml"

@@ -8,10 +8,11 @@ btrfs-snapman-cli: the terminal front end of btrfs-snapman, for SSH and headless
 Runs as your normal user. Every operation goes through the same three root helpers as
 the GUI, but via sudo instead of pkexec (or directly when already root):
 
-  snapman-query   list                          uses the sudo timestamp
+  snapman-query   list | discover               uses the sudo timestamp
   snapman-admin   snapshot | delete | set-ro    uses the sudo timestamp
   snapman-manage  new-volume | remove-volume |  password every time (sudo -k, then sudo -v)
-                  add-parent | remove-parent
+                  add-parent | remove-parent |
+                  register
 
 It never imports snapman_core or btrfsutil and never writes to /etc/btrfs-snapman.
 Logic shared with the GUI lives in snapman_client.py.
@@ -31,9 +32,11 @@ import sys
 sys.path.insert(1, "/usr/lib/btrfs-snapman")
 from snapman_client import (LIBEXEC, NAME_RE, fmt_age, fmt_time, helper_argv,  # noqa: E402
                             log_lines, mount_of, new_volume_preview, parse_helper_output,
-                            preview_name, remove_summary, sanitise_label, suggest_snapshot_root)
+                            preview_name, read_volume_file, register_args, remove_summary,
+                            render_toml, sanitise_label, suggest_snapshot_root,
+                            suggest_volumes)
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # Exit codes
 EXIT_FAILED = 1         # the helper refused or failed
@@ -374,6 +377,70 @@ def cmd_remove_location(ctx, a):
     ctx.out.result(f"Removed location {path}")
 
 
+def register(ctx, items, yes):
+    """Show what register will do, confirm, then register everything in one call."""
+    w = max(len(it["name"]) for it in items)
+    for it in items:
+        fmt = it["name_format"] or "default name format"
+        ctx.out.info(f"  {it['name']:<{w}}  {it['path']} -> {it['snapshot_dir']}  ({fmt})")
+    if not yes:
+        if not ctx.helpers.interactive:
+            raise Abort(EXIT_DECLINED, "not confirmed: registering needs --yes when there is "
+                                       "no terminal")
+        n = len(items)
+        if ask(f"Register {'this volume' if n == 1 else f'these {n} volumes'}? [y/N] ") \
+                .strip().lower() not in ("y", "yes"):
+            raise Abort(EXIT_DECLINED, "not confirmed; nothing changed")
+    res = ctx.call("manage", register_args(items))["result"]
+    ctx.out.result("Registered " + ", ".join(res["registered"]))
+
+
+def cmd_discover(ctx, a):
+    if a.names and not a.install:
+        raise Abort(EXIT_USAGE, "volume names only go with --install")
+    found = ctx.call("query", ["discover"], show=not (a.toml or a.install))["result"]
+    suggestions = suggest_volumes(found, ctx.list()["volumes"])
+    new = [s for s in suggestions if s["status"] == "new"]
+    if a.toml:
+        sys.stdout.write(render_toml(suggestions))
+        return
+    if a.install:
+        if a.names:
+            unknown = [n for n in a.names if n not in {s["name"] for s in new}]
+            if unknown:
+                raise Abort(EXIT_FAILED, f"not a new suggestion: {', '.join(unknown)} "
+                                         "(see btrfs-snapman-cli discover)")
+            new = [s for s in new if s["name"] in a.names]
+        if not new:
+            ctx.out.result("Nothing new to register")
+            return
+        register(ctx, new, a.yes)
+        return
+    if ctx.out.json:
+        return
+    rows = []
+    for s in suggestions:
+        if s["status"] == "new":
+            detail = f"{s['snapshot_dir']}  ({s['why']})"
+        else:
+            detail = "" if s["status"] == "configured" else s["why"]
+        rows.append([s["status"], s["name"], s["path"], detail])
+    ctx.out.table(rows, ["STATUS", "VOLUME", "PATH", "SNAPSHOTS IN"])
+    if new:
+        ctx.out.info("Review with --toml, or register these with --install [NAME ...]", "dim")
+
+
+def cmd_register(ctx, a):
+    try:
+        with open(a.file) as f:
+            items = read_volume_file(f.read())
+    except OSError as e:
+        raise Abort(EXIT_FAILED, f"can't read {a.file}: {e.strerror}")
+    except ValueError as e:
+        raise Abort(EXIT_FAILED, f"{a.file}: {e}")
+    register(ctx, items, a.yes)
+
+
 # =========================================================================== argument parsing
 
 def build_parser():
@@ -456,6 +523,21 @@ def build_parser():
 
     s = cmd("remove-location", cmd_remove_location, "withdraw an approved location")
     s.add_argument("path", metavar="PATH")
+    s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
+
+    s = cmd("discover", cmd_discover,
+            "find the subvolumes on every mounted btrfs filesystem and suggest volumes")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--toml", action="store_true",
+                   help="print the suggestions as config to review (see 'register')")
+    g.add_argument("--install", action="store_true",
+                   help="register the suggested volumes (all new ones, or just NAMEs)")
+    s.add_argument("names", nargs="*", metavar="NAME", help="with --install: only these")
+    s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
+
+    s = cmd("register", cmd_register,
+            "register existing subvolumes from a TOML file of [[volume]] tables")
+    s.add_argument("file", metavar="FILE", help="e.g. edited output of 'discover --toml'")
     s.add_argument("--yes", action="store_true", help="don't ask (required without a terminal)")
     return p
 

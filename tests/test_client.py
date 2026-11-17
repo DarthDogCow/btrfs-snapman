@@ -143,5 +143,139 @@ class HelperCalls(unittest.TestCase):
         self.assertEqual(c.parse_helper_output(2, "", "")[1]["error"], "helper exited 2")
 
 
+# A discover result built from (path in fs, read-only, parent) rows; uuids are made up
+def fake_fs(rows, mounts, label="", reach=None):
+    uuids = {path: f"{i:08x}-0000-0000-0000-000000000000" for i, (path, _, _) in
+             enumerate(rows, start=1)}
+    reach = reach or (lambda p: f"{mounts[0][0]}/{p}")
+    subs = []
+    for i, (path, ro, parent) in enumerate(rows, start=256):
+        subs.append({"id": i, "parent_id": 5, "path": path, "reachable": reach(path),
+                     "uuid": uuids[path],
+                     "parent_uuid": uuids.get(parent, parent or c.NIL_UUID),
+                     "received": False, "read_only": ro, "otime": 0})
+    return {"fsid": "f" * 8, "label": label, "error": None, "subvolumes": subs,
+            "mounts": [{"path": mp, "subvol": sv} for mp, sv in mounts]}
+
+
+# Shaped like a home server: live docker and cluster at the top, labelled snapshots in
+# snapshots/adhoc, timestamp-only ones from scheduled jobs in snapshots/<name>
+SERVER = fake_fs([
+    ("docker", False, None),
+    ("docker/archive/old", False, None),
+    ("cluster", False, None),
+    ("snapshots/adhoc/docker_local_2026-05-19_13-06-53_Before_change", True, "docker"),
+    ("snapshots/adhoc/docker_local_2026-11-16_22-26-50_After_fix", True, "docker"),
+    ("snapshots/adhoc/cluster_2026-11-16_13-44-37_Old_cluster", True, "gone-uuid"),
+    ("snapshots/docker/2026-11-12_01-00-01", True, "docker"),
+    ("snapshots/docker/2026-11-13_01-00-01", True, "docker"),
+    ("snapshots/cluster/2026-11-17_11-10-03", True, "cluster"),
+], [("/media/SSD1", "/")], label="SSD1")
+
+# Shaped like a laptop: no top-level mount, / and /home are subvolumes, plus Docker's
+LAPTOP_MOUNTS = {"@": "/", "@home": "/home"}
+LAPTOP = fake_fs([
+    ("@", False, None),
+    ("@home", False, None),
+    ("@swap", False, None),
+    ("@/var/lib/docker/btrfs/subvolumes/aaa", False, None),
+    ("@/var/lib/docker/btrfs/subvolumes/bbb", False, None),
+], [("/", "/@"), ("/home", "/@home")],
+    reach=lambda p: LAPTOP_MOUNTS.get(p) or (("/" + p[2:]) if p.startswith("@/") else None))
+
+
+def by_path(suggestions):
+    return {s["path"]: s for s in suggestions}
+
+
+class Discover(unittest.TestCase):
+    def test_split_snapshot_name(self):
+        self.assertEqual(c.split_snapshot_name("docker_local_2026-11-16_13-44-37_Fix_it"),
+                         ("docker_local_", "%Y-%m-%d_%H-%M-%S", "Fix_it"))
+        self.assertEqual(c.split_snapshot_name("2026-11-12_01-00-01"),
+                         ("", "%Y-%m-%d_%H-%M-%S", ""))
+        self.assertEqual(c.split_snapshot_name("20261116-134437_pre"),
+                         ("", "%Y%m%d-%H%M%S", "pre"))
+        self.assertEqual(c.split_snapshot_name("x-2026-11-16_13-44"),
+                         ("x-", "%Y-%m-%d_%H-%M", ""))
+        self.assertIsNone(c.split_snapshot_name("manual-old"))
+
+    def test_server_layout(self):
+        got = by_path(c.suggest_volumes({"filesystems": [SERVER]}, []))
+        docker = got["/media/SSD1/docker"]
+        self.assertEqual(docker["status"], "new")
+        self.assertEqual(docker["snapshot_dir"], "/media/SSD1/snapshots/adhoc")
+        # the existing prefix is kept, not replaced by the volume name
+        self.assertEqual(docker["name_format"], "docker_local_{timestamp}_{label}")
+        self.assertEqual(docker["timestamp_format"], "%Y-%m-%d_%H-%M-%S")
+        self.assertEqual(docker["alternatives"], [("/media/SSD1/snapshots/docker", 2)])
+        # cluster's own snapshots are all scheduled; the labelled folder is shared
+        cluster = got["/media/SSD1/cluster"]
+        self.assertEqual(cluster["snapshot_dir"], "/media/SSD1/snapshots/adhoc")
+        self.assertEqual(cluster["name_format"], "{volume}_{timestamp}_{label}")
+        self.assertIn("other snapshots with comments", cluster["why"])
+        nested = got["/media/SSD1/docker/archive/old"]
+        self.assertEqual(nested["status"], "skipped")
+        self.assertIn("inside docker", nested["why"])
+        # snapshots themselves are never suggested
+        self.assertFalse(any("snapshots/" in p for p in got))
+
+    def test_laptop_layout(self):
+        sugg = c.suggest_volumes({"filesystems": [LAPTOP]}, [])
+        got = by_path(sugg)
+        self.assertEqual((got["/"]["name"], got["/"]["snapshot_dir"]), ("root", "/snapshots/root"))
+        self.assertEqual((got["/home"]["name"], got["/home"]["snapshot_dir"]),
+                         ("home", "/snapshots/home"))
+        self.assertEqual(got["/home"]["why"], "new folder")
+        skipped = [s["why"] for s in sugg if s["status"] == "skipped"]
+        self.assertIn("2 subvolume(s) under var/lib/docker, which belong to another tool", skipped)
+        self.assertIn("swap", skipped)
+        self.assertEqual(len([s for s in sugg if s["status"] == "new"]), 2)
+
+    def test_configured_and_name_clash(self):
+        vols = [{"name": "home", "path": "/home"}, {"name": "docker", "path": "/srv/other"}]
+        got = by_path(c.suggest_volumes({"filesystems": [SERVER, LAPTOP]}, vols))
+        self.assertEqual((got["/home"]["status"], got["/home"]["name"]), ("configured", "home"))
+        self.assertEqual(got["/media/SSD1/docker"]["name"], "docker-2")
+
+    def test_snapshots_next_to_live_subvolumes(self):
+        # Labelled snapshots kept beside the live subvolumes: that folder would let a
+        # snapshot delete reach a live subvolume, so a new folder is used instead
+        fs = fake_fs([("Music", False, None), ("Video", False, None),
+                      ("Music_2025-05-26_21-06-48_Initial", True, "Music")],
+                     [("/media/RAID", "/")])
+        got = by_path(c.suggest_volumes({"filesystems": [fs]}, []))
+        self.assertEqual(got["/media/RAID/Music"]["status"], "new")
+        self.assertEqual(got["/media/RAID/Music"]["snapshot_dir"], "/media/RAID/snapshots/Music")
+
+    def test_writable_snapshot_is_not_a_volume(self):
+        fs = fake_fs([("data", False, None), ("snaps/a_2026-01-01_00-00-00_x", True, "data"),
+                      ("snaps/a_2026-01-02_00-00-00_y", False, "data")], [("/m", "/")])
+        got = by_path(c.suggest_volumes({"filesystems": [fs]}, []))
+        self.assertEqual([p for p, s in got.items() if s["status"] == "new"], ["/m/data"])
+
+    def test_toml_round_trip(self):
+        sugg = c.suggest_volumes({"filesystems": [SERVER]}, [{"name": "x", "path": "/nope"}])
+        text = c.render_toml(sugg)
+        self.assertIn("# /media/SSD1/docker/archive/old: inside docker", text)
+        items = c.read_volume_file(text)
+        self.assertEqual([i["name"] for i in items], ["cluster", "docker"])
+        self.assertEqual(items[1]["name_format"], "docker_local_{timestamp}_{label}")
+        args = c.register_args(items)
+        self.assertEqual(args[:6], ["register", "cluster", "/media/SSD1/cluster",
+                                    "/media/SSD1/snapshots/adhoc",
+                                    "{volume}_{timestamp}_{label}", "%Y-%m-%d_%H-%M-%S"])
+
+    def test_read_volume_file(self):
+        items = c.read_volume_file('[volume]\nname = "a"\npath = "/a"\nsnapshot_dir = "/s"\n')
+        self.assertEqual(items, [{"name": "a", "path": "/a", "snapshot_dir": "/s",
+                                  "name_format": None, "timestamp_format": None}])
+        self.assertEqual(c.register_args(items), ["register", "a", "/a", "/s", "-", "-"])
+        for bad in ('[[volume]]\nname = "a"\n', "nonsense =", "[defaults]\nx = 1\n",
+                    '[[volume]]\nname="a"\npath="/a"\nsnapshot_dir="/s"\npre_snapshot=[]\n'):
+            with self.assertRaises(ValueError):
+                c.read_volume_file(bad)
+
+
 if __name__ == "__main__":
     unittest.main()
