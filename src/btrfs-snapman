@@ -10,13 +10,12 @@ via pkexec, and each has its own polkit rule:
   snapman-manage  new-volume | remove-volume |  password every time
                   add-parent
 
+Logic shared with btrfs-snapman-cli lives in snapman_client.py.
 Run with --no-pkexec only when already root (used for testing).
 """
 
 import datetime as dt
-import json
 import os
-import re
 import sys
 
 import gi
@@ -25,62 +24,20 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+# Shared with btrfs-snapman-cli. After the script's own folder, so a checkout runs its own copy.
+sys.path.insert(1, "/usr/lib/btrfs-snapman")
+from snapman_client import (LIBEXEC, NAME_RE, fmt_age, fmt_time, helper_argv,  # noqa: E402
+                            mount_of, new_volume_preview, parse_helper_output, preview_name,
+                            remove_summary, sanitise_label, suggest_snapshot_root)
+
 APP_ID = "io.github.darthdogcow.BtrfsSnapman"
-LIBEXEC = "/usr/libexec/btrfs-snapman"
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")   # must match the helper's NAME_RE
 
 
 # =========================================================================== small helpers
 
-def sanitise_label(text):
-    """Clean a comment for use in a name: spaces -> '_', keep only [A-Za-z0-9_-]."""
-    return re.sub(r"[^A-Za-z0-9_-]", "", text.replace(" ", "_"))[:64]
-
-
-def preview_name(v, label):
-    """What the helper will name a snapshot taken now (it builds the real name the same way)."""
-    ts = dt.datetime.now().strftime(v.get("timestamp_format", "%Y%m%d-%H%M%S"))
-    name = v["name_format"].format(volume=v["name"], timestamp=ts, label=label)
-    return re.sub(r"__+", "_", name).strip("_-")
-
-
-def fmt_time(epoch):
-    return dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def fmt_age(epoch):
-    """e.g. '3d ago', '5h ago'."""
-    secs = max(0, int(dt.datetime.now().timestamp() - epoch))
-    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
-        if secs >= n:
-            return f"{secs // n}{unit} ago"
-    return "just now"
-
-
 def esc(text):
     """libadwaita titles and subtitles are Pango markup, so escape <, & etc."""
     return GLib.markup_escape_text(str(text))
-
-
-def mount_of(path):
-    """(mount point, fs type) of the mount that contains path, from /proc/self/mountinfo."""
-    best = ("/", "")
-    try:
-        with open("/proc/self/mountinfo") as f:
-            for line in f:
-                pre, _, post = line.partition(" - ")
-                fields, post_fields = pre.split(), post.split()
-                if len(fields) < 5 or not post_fields:
-                    continue
-                # mountinfo escapes spaces etc. as \040; turn them back into characters
-                mp = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
-                inside = mp == "/" or path == mp or path.startswith(mp + "/")
-                # later lines are mounted on top of earlier ones, so >= keeps the visible one
-                if inside and len(mp) >= len(best[0]):
-                    best = (mp, post_fields[0])
-    except OSError:
-        pass
-    return best
 
 
 # =========================================================================== helper runner
@@ -93,8 +50,7 @@ class Helper:
         self.libexec = libexec
 
     def run(self, mode, args, callback):
-        exe = f"{self.libexec}/snapman-{mode}"
-        argv = (["pkexec", exe] if self.use_pkexec else [exe]) + list(args)
+        argv = helper_argv(mode, args, "pkexec" if self.use_pkexec else None, self.libexec)
         try:
             proc = Gio.Subprocess.new(
                 argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE)
@@ -108,18 +64,7 @@ class Helper:
             except GLib.Error as e:
                 callback({"ok": False, "error": e.message})
                 return
-            # pkexec uses exit code 126 for "dialog dismissed", 127 for "not authorised"
-            status = p.get_exit_status()
-            if status == 126:
-                callback({"ok": False, "error": "Authentication cancelled", "cancelled": True})
-                return
-            if status == 127 and not (out or "").strip():
-                callback({"ok": False, "error": "Not authorised (polkit)"})
-                return
-            try:
-                callback(json.loads(out))
-            except (ValueError, TypeError):
-                callback({"ok": False, "error": (err or out or f"helper exited {status}").strip()})
+            callback(parse_helper_output(p.get_exit_status(), out, err)[1])
 
         proc.communicate_utf8_async(None, None, done)
 
@@ -615,12 +560,8 @@ class Window(Adw.ApplicationWindow):
                 nocow.set_active(False)
             d.set_response_label("create", "Register" if existing.get_active() else "Create")
             d.set_response_enabled("create", ok)
-            if p and fol:
-                what = "Register" if existing.get_active() else "Subvolume"
-                result.set_subtitle(esc(f"{what}: {p['path']}/{fol}\n"
-                                        f"Snapshots: {p['snapshot_root']}/{fol}/"))
-            else:
-                result.set_subtitle("—")
+            lines = new_volume_preview(p, fol, existing.get_active())
+            result.set_subtitle(esc("\n".join(lines)) if lines else "—")
         for w, sig in ((parent, "notify::selected"), (name, "changed"), (folder, "changed"),
                        (existing, "notify::active")):
             w.connect(sig, update)
@@ -677,7 +618,7 @@ class Window(Adw.ApplicationWindow):
         folder = Adw.ActionRow(title="Folder", subtitle=esc(path))
         folder.set_subtitle_selectable(True)
         folder.add_css_class("property")
-        snap_root = [os.path.join(mp, "snapshots")]
+        snap_root = [suggest_snapshot_root(path)]
         root = Adw.ActionRow(title="Snapshot root", subtitle=esc(snap_root[0]))
         root.set_subtitle_selectable(True)
         root.add_css_class("property")
@@ -751,17 +692,7 @@ class Window(Adw.ApplicationWindow):
                 snaps.set_active(False)
             if snaps.get_active():
                 final.set_active(False)
-            if not deleting:
-                text = "Only the registration is removed. Nothing on disk changes."
-            elif snaps.get_active():
-                text = (f"The subvolume, all {nsnaps} snapshot(s) and the snapshot folder are "
-                        "deleted. Nothing is kept.")
-            elif final.get_active():
-                text = ("A final read-only snapshot is taken, then the subvolume is deleted. "
-                        f"Snapshots stay in {v['snapshot_dir']} but are no longer listed here.")
-            else:
-                text = (f"The subvolume is deleted. Snapshots stay in {v['snapshot_dir']} "
-                        "but are no longer listed here.")
+            text = remove_summary(v, deleting, final.get_active(), snaps.get_active())
             summary.set_subtitle(esc(text))
             d.set_response_label("remove", "Delete" if deleting else "Unregister")
             d.set_response_enabled("remove", confirm.get_text() == v["name"])
